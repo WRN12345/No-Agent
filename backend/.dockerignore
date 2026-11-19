@@ -1,5 +1,5 @@
-__pycache__/
-*.pyc
 .env
+.no-agent/
+.pytest_tmp/
 tests/
-.vscode/
+**/__pycache__

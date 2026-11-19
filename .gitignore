@@ -235,3 +235,5 @@ frontend/vue-project/__screenshots__/
 frontend/vue-project/*.timestamp-*-*.mjs
 frontend/vue-project/.vscode/*
 !frontend/vue-project/.vscode/extensions.json
+# No-Agent：.no-agent/ 内部自带 .gitignore（技能提交、运行数据忽略）
+backend/.pytest_tmp/
