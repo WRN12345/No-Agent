@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "id": "fill_form",
+  "name": "填写网页表单",
+  "description": "在浏览器中填写任意网页表单：读取页面全部字段，用已知信息自动对应填写，缺失的必填项一次性询问用户，填写后回读校验，经用户确认后提交。",
+  "when_to_use": "用户要在某个网页上填写/提交表单（注册、报名、申请、报销、登记等），可以给出网址和要填的信息。不适用于需要上传文件、验证码、或多页向导式流程中的跳转。",
+  "keywords": [
+    "表单",
+    "填写",
+    "填表",
+    "提交",
+    "网页",
+    "报名",
+    "申请",
+    "登记",
+    "form",
+    "fill"
+  ],
+  "params_schema": {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string",
+        "description": "表单页面网址；不填则使用浏览器当前页面"
+      },
+      "data": {
+        "description": "用户已提供的要填写的信息（对象或自然语言文本）"
+      },
+      "submit": {
+        "type": "boolean",
+        "description": "填完后是否提交（提交前会请求确认）",
+        "default": true
+      },
+      "scope": {
+        "type": "string",
+        "description": "可选，限定表单所在区域的 CSS 选择器"
+      }
+    },
+    "required": []
+  },
+  "status": "active",
+  "active_version": 1,
+  "versions": [
+    {
+      "version": 1,
+      "reason": "框架内置",
+      "parent": null,
+      "test_pass_rate": null
+    }
+  ],
+  "tests": []
+}

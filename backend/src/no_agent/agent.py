@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from no_agent.config import AgentConfig
+from no_agent.interact import Asker, default_asker, make_ask_tool
 from no_agent.engine.agent import EvolvingAgent, RunMode
 from no_agent.engine.evolver import Evolver
 from no_agent.llm import LLMs, build_llms
@@ -34,6 +35,9 @@ from no_agent.storage.home import init_home, resolve_home
 from no_agent.storage.sql import Run, SqlRunStore
 from no_agent.tools.base import Tool, ToolRegistry
 from no_agent.tools.builtin import builtin_tools
+
+BUILTIN_SKILLS_DIR = Path(__file__).parent / "builtin_skills"
+_DEFAULT = object()
 
 logger = logging.getLogger(__name__)
 
@@ -48,14 +52,23 @@ class Agent:
         llms: LLMs | None = None,
         skill_store: SkillStore | None = None,
         run_store: RunStore | None = None,
+        asker: Asker | None = _DEFAULT,  # type: ignore[assignment]
     ) -> None:
+        """
+        asker：向用户提问 / 请求确认的方式。默认在交互式终端中使用终端提问，
+               非交互环境（服务、后台任务）为 None——此时需确认的操作会被拒绝（除非 auto_confirm）
+        """
         self.config = cfg = config or AgentConfig()
         self._home: Path | None = None
+        self.asker: Asker | None = default_asker() if asker is _DEFAULT else asker
+        self.browser = None
 
         # ── 存储：只有用到默认实现时才创建 home 目录 ──
+        # 技能层（优先级从低到高）：框架内置 → extra_skill_dirs → 本地可写层
+        builtin_layers = [BUILTIN_SKILLS_DIR] if cfg.browser.enabled else []
         self.store: SkillStore = skill_store or FileSkillStore(
             cfg.skills_dir or self.home / "skills",
-            readonly_dirs=cfg.extra_skill_dirs,
+            readonly_dirs=[*builtin_layers, *cfg.extra_skill_dirs],
             stats_dir=self.home / ".stats",
         )
         self.runs: RunStore = run_store or SqlRunStore(cfg.database_url or f"sqlite:///{(self.home / 'runs.db').as_posix()}")
@@ -64,6 +77,13 @@ class Agent:
         self.registry = ToolRegistry()
         if include_builtin_tools:
             for t in builtin_tools(cfg.workspace_dir or self.home / "workspace"):
+                self.registry.register(t)
+        self.registry.register(make_ask_tool(self.asker))
+        if cfg.browser.enabled:
+            from no_agent.tools.browser import BrowserSession, make_browser_tools
+
+            self.browser = BrowserSession(cfg.browser)
+            for t in make_browser_tools(self.browser):
                 self.registry.register(t)
         for t in tools or []:
             self.registry.register(t)
@@ -89,6 +109,7 @@ class Agent:
             runs=self.runs,
             evolver=self.evolver,
             settings=cfg,
+            asker=self.asker,
         )
 
     @property
@@ -113,6 +134,8 @@ class Agent:
         if wait:
             await self.evolver.drain()
         await self.evolver.stop()
+        if self.browser is not None:
+            await self.browser.close()
 
     async def wait_idle(self) -> None:
         """等待所有进化任务完成"""

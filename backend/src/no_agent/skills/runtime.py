@@ -14,7 +14,7 @@ from typing import Any
 
 from no_agent.llm import BaseLLM, parse_json
 from no_agent.skills.script import SCRIPT_FILENAME, ScriptError, load_script
-from no_agent.tools.base import Toolbox, ToolError, to_jsonable, truncate
+from no_agent.tools.base import Toolbox, ToolError, UserAbort, to_jsonable, truncate
 
 
 class StepFailure(Exception):
@@ -46,6 +46,15 @@ class StepContext:
         reply = await self._llm.complete([{"role": "user", "content": content}], purpose="script_llm")
         return parse_json(reply.content) if json else reply.content.strip()
 
+    async def ask(self, questions: list[dict[str, Any]], title: str = "") -> dict[str, Any]:
+        """一次性向用户提出多个问题，返回 {key: 回答}"""
+        return await self.tool("ask_user", questions=questions, title=title)
+
+    async def confirm(self, message: str) -> bool:
+        """向用户确认一件事，返回是否同意"""
+        out = await self.ask([{"key": "ok", "label": message, "kind": "confirm"}], title="需要你确认")
+        return bool(out.get("ok"))
+
     def log(self, msg: Any) -> None:
         self.logs.append(f"[{self._step}] {msg}")
 
@@ -72,6 +81,7 @@ class ExecutionResult:
     all_steps: list[str] = field(default_factory=list)
     state: dict[str, Any] = field(default_factory=dict)
     logs: list[str] = field(default_factory=list)
+    aborted: bool = False  # 用户取消（不是脚本的错）
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -80,6 +90,7 @@ class ExecutionResult:
             "error": self.error,
             "steps": [s.__dict__ for s in self.steps],
             "logs": self.logs[-20:],
+            "aborted": self.aborted,
         }
 
 
@@ -92,6 +103,25 @@ def _format_exc(e: BaseException) -> str:
     frames = [f for f in traceback.extract_tb(e.__traceback__) if f.filename == SCRIPT_FILENAME]
     where = f"（脚本第 {frames[-1].lineno} 行）" if frames else ""
     return f"{type(e).__name__}: {e}{where}"
+
+
+async def _run_step(coro: Any, toolbox: Toolbox, timeout: float) -> Any:
+    """执行一个步骤；超时只计算"自己在忙"的时间，等待用户输入的时间不算"""
+    task = asyncio.ensure_future(coro)
+    start, waited0 = time.perf_counter(), toolbox.waited_total()
+    while True:
+        busy = time.perf_counter() - start - (toolbox.waited_total() - waited0)
+        remaining = timeout - busy
+        if remaining <= 0 and toolbox.waiting_since is None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            raise asyncio.TimeoutError
+        done, _ = await asyncio.wait({task}, timeout=max(remaining, 0.2))
+        if done:
+            return task.result()
 
 
 async def execute_script(
@@ -123,9 +153,13 @@ async def execute_script(
         t0 = time.perf_counter()
         error: str | None = None
         try:
-            ret = await asyncio.wait_for(s.func(ctx), timeout=step_timeout)
+            ret = await _run_step(s.func(ctx), toolbox, step_timeout)
             if ret is not None:
                 ctx.result = ret
+        except UserAbort as e:
+            res.steps.append(StepRecord(name=s.name, ok=False, ms=int((time.perf_counter() - t0) * 1000), idempotent=s.idempotent, error=str(e)))
+            res.aborted = True
+            return finish(False, s.name, f"用户取消: {e}")
         except StepFailure as e:
             error = f"主动失败: {e}"
         except ToolError as e:

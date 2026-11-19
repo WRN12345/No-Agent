@@ -17,6 +17,7 @@
 ```bash
 pip install No-Agent              # 核心库
 pip install "No-Agent[server]"    # 附带 HTTP 服务（FastAPI）
+pip install "No-Agent[browser]"   # 附带浏览器工具（Playwright，默认使用本机 Chrome）
 ```
 
 本仓库开发：`cd backend && pip install -e ".[dev]" && python -m pytest`（离线跑通完整进化闭环，使用假 LLM）。
@@ -47,6 +48,41 @@ run = agent.run_sync("查一下所有待发货的订单")      # 同步代码中
 ```
 
 也可以从环境变量读配置：`Agent(AgentConfig.from_env())`，变量见 [.env.example](.env.example)（前缀 `NO_AGENT_`）。
+
+## 浏览器与人机交互
+
+不走"截图 → 看图 → 移鼠标"的 computer use，而是读元素树、批量操作：
+
+```python
+from no_agent import Agent, AgentConfig, BrowserConfig
+
+agent = Agent(AgentConfig(browser=BrowserConfig(enabled=True)))   # 框架自己启动本机 Chrome
+async with agent:
+    run = await agent.run("在 https://example.com/apply 填写报名表，我叫张三，技术部")
+```
+
+运行示例：`python examples/fill_form.py <网址> "要填写的信息"`
+
+**内置 `fill_form` 技能**（开启浏览器后自动加载，可被修补、可在本地覆盖）：
+
+```
+open_page → snapshot（一次读出全部字段：标签/类型/必填/选项/稳定选择器）
+          → map_values（小模型把已知信息对应到字段，只填有依据的）
+          → ask_missing（缺失的必填项在终端里一次问完）
+          → fill（批量填写）→ check（回读校验，不一致就失败、交给 AI 接管）
+          → submit（框架强制请求确认，确认内容里带填写摘要）
+```
+
+**浏览器工具**：`browser_open` / `browser_snapshot` / `browser_fill` / `browser_read` / `browser_click` / `browser_submit` / `browser_text`。提交按钮只能通过 `browser_submit`，`browser_click` 会拒绝点击提交按钮。
+
+**提问与确认**：
+
+- 脚本里用 `await ctx.ask([...])` / `await ctx.confirm("...")`，AI 自由执行时用 `ask_user` 工具，都要求**一次问完**
+- 工具声明 `confirm=True`（如 `browser_submit`）后，执行前由框架强制确认，不依赖脚本或模型自觉；默认每次都问，`auto_confirm=True` 可关闭
+- 用户拒绝确认或输入 `:q` 取消 → `mode="aborted"`：不算脚本失败，不触发接管 / 修补，不计入技能统计
+- 等待用户输入的时间不计入步骤超时
+- 问答会录进轨迹，提炼和测试回放时直接用录制的回答，不会再弹问题，也不会真的提交
+- 提问方式可替换：`Agent(asker=...)`，实现 `ask()` / `confirm()` 即可（默认终端；非交互环境为 None，此时需确认的操作一律拒绝）。`ScriptedAsker` 用于测试和无人值守的批处理
 
 ## 数据存在哪
 
@@ -123,7 +159,9 @@ docker compose up                  # 见 ../docker-compose.yml，数据在 /data
 | `src/no_agent/skills/runtime.py` | 逐步执行器，精确报告失败步骤、错误行号、当时状态 |
 | `src/no_agent/skills/matcher.py` | 本地召回（向量 / 词法）+ 小模型判定与参数抽取 |
 | `src/no_agent/storage/` | 存储协议、分层文件技能库、SQL 运行记录、home 解析 |
-| `src/no_agent/tools/` | 工具层；内置 calculator / http_request / 文件读写 / current_time |
+| `src/no_agent/tools/` | 工具层；内置 calculator / http_request / 文件读写 / current_time；`browser.py` 浏览器工具 |
+| `src/no_agent/interact.py` | 提问与确认：`Asker` 协议、终端实现、`ask_user` 工具 |
+| `src/no_agent/builtin_skills/` | 随框架分发的只读技能（`fill_form`） |
 | `src/no_agent/server/` | 可选 HTTP 服务 |
 
 ## 关键设计
@@ -143,4 +181,5 @@ docker compose up                  # 见 ../docker-compose.yml，数据在 /data
 - **单进程**：进化器是进程内 asyncio 队列，文件技能库用进程内锁。多进程 / 多实例部署需要外部队列和带锁的存储（可通过自定义 `SkillStore` 实现）。
 - **命名空间（多租户）**：尚未支持，计划后续加入，届时通过 `schema_version` 迁移已有数据。
 - **共享技能的上游更新**：技能一旦复制到本地，本地版本优先，不会自动合并上游更新。
+- **浏览器**：每个 Agent 共用一个页面，暂不支持多标签页、文件上传、验证码；`run_sync` 每次调用结束都会关闭浏览器。
 - **待做**：技能合并（重叠去重）、`kind="llm"` 步骤稳定后自动固化成代码、技能组合、健康度看板。

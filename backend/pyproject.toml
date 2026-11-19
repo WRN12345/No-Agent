@@ -18,10 +18,14 @@ dependencies = [
 
 [project.optional-dependencies]
 server = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
-dev = ["No-Agent[server]", "pytest>=8.0", "pytest-asyncio>=0.24"]
+browser = ["playwright>=1.45"]
+dev = ["No-Agent[server,browser]", "pytest>=8.0", "pytest-asyncio>=0.24"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+no_agent = ["builtin_skills/*/*.py", "builtin_skills/*/*.json"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -201,4 +201,4 @@ def test_api(agent, strong, web):
         fb = client.post("/api/v1/feedback", json={"run_id": r["run_id"], "score": -1, "comment": "不对"}).json()
         assert fb["ok"] and not fb["patch_queued"]
         assert client.get("/api/v1/skills").json() == []
-        assert [t["name"] for t in client.get("/api/v1/tools").json()] == ["fetch_page"]
+        assert [t["name"] for t in client.get("/api/v1/tools").json()] == ["ask_user", "fetch_page"]

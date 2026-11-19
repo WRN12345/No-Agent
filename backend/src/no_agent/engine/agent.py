@@ -1,6 +1,8 @@
 """
 自进化 Agent 主流程
 
+    （任何时候用户拒绝确认 / 取消输入 → mode=aborted，不计入统计，不触发进化）
+
     任务 ─► 匹配技能 ──命中──► 执行脚本 ──成功──► 完成（最快、最省）
               │                   │
               │                   └─失败─► AI 从失败步骤接管 ──► 完成 ──► [异步] 修补脚本
@@ -24,7 +26,7 @@ from no_agent.storage.sql import Run
 from no_agent.skills.matcher import MatchResult, SkillMatcher
 from no_agent.skills.runtime import ExecutionResult, execute_script
 from no_agent.skills.script import function_source
-from no_agent.tools.base import Toolbox, ToolRegistry
+from no_agent.tools.base import Toolbox, ToolRegistry, UserAbort
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,7 @@ class EvolvingAgent:
         runs: RunStore,
         evolver: Evolver,
         settings: AgentConfig,
+        asker: Any = None,
     ) -> None:
         self.store = store
         self.matcher = matcher
@@ -50,6 +53,7 @@ class EvolvingAgent:
         self.runs = runs
         self.evolver = evolver
         self.s = settings
+        self.asker = asker
 
     async def run(
         self,
@@ -60,8 +64,9 @@ class EvolvingAgent:
         params: dict[str, Any] | None = None,
     ) -> Run:
         t0 = time.perf_counter()
-        toolbox = Toolbox(self.registry, timeout=self.s.tool_timeout)
+        toolbox = Toolbox(self.registry, timeout=self.s.tool_timeout, asker=self.asker, auto_confirm=self.s.auto_confirm)
         trace: dict[str, Any] = {}
+        abort: str | None = None
 
         with metered() as meter:
             match = await self._select(task, mode, skill_id, params)
@@ -81,7 +86,9 @@ class EvolvingAgent:
                     source, task=task, params=match.params, toolbox=toolbox, llm=self.llms.fast, step_timeout=self.s.step_timeout
                 )
                 trace["execution"] = exe.summary()
-                if not exe.success:
+                if exe.aborted:
+                    abort = exe.error
+                elif not exe.success:
                     logger.info("技能 %s 在 %s 失败: %s → AI 接管", match.skill.id, exe.failed_step, exe.error)
                     trace["state_at_failure"] = exe.state
                     takeover = TakeoverContext(
@@ -96,11 +103,15 @@ class EvolvingAgent:
                         state=exe.state,
                         side_effects=toolbox.side_effect_calls(),
                     )
-                    ff = await self._freeform(task, toolbox, takeover)
+                    ff, abort = await self._freeform(task, toolbox, takeover)
             else:
-                ff = await self._freeform(task, toolbox, None)
+                ff, abort = await self._freeform(task, toolbox, None)
 
-        if exe and exe.success:
+        if abort:
+            # 用户取消：不是脚本或 AI 的错，不计入统计、不触发进化
+            run_mode, success, result, error = "aborted", False, None, abort
+            trace["aborted"] = abort
+        elif exe and exe.success:
             run_mode, success, result, error = "skill", True, exe.result, None
         else:
             assert ff is not None
@@ -131,6 +142,8 @@ class EvolvingAgent:
             )
         )
 
+        if abort:
+            return run
         if match:
             self._record_skill(match, exe, success, latency)
             if run_mode == "skill_takeover" and success:
@@ -154,15 +167,20 @@ class EvolvingAgent:
             return m or MatchResult(skill=skill, params={}, confidence=0.0, reason="指定技能，未能抽取参数")
         return await self.matcher.match(task)
 
-    async def _freeform(self, task: str, toolbox: Toolbox, takeover: TakeoverContext | None) -> FreeformResult:
-        return await run_freeform(
-            task,
-            llm=self.llms.strong,
-            toolbox=toolbox,
-            registry=self.registry,
-            max_turns=self.s.freeform_max_turns,
-            takeover=takeover,
-        )
+    async def _freeform(self, task: str, toolbox: Toolbox, takeover: TakeoverContext | None) -> tuple[FreeformResult | None, str | None]:
+        try:
+            ff = await run_freeform(
+                task,
+                llm=self.llms.strong,
+                toolbox=toolbox,
+                registry=self.registry,
+                max_turns=self.s.freeform_max_turns,
+                takeover=takeover,
+            )
+            return ff, None
+        except UserAbort as e:
+            return None, f"用户取消: {e}"
+
 
     def _record_skill(self, match: MatchResult, exe: ExecutionResult | None, success: bool, latency: int) -> None:
         skill = self.store.get(match.skill.id)

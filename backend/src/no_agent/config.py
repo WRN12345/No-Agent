@@ -35,8 +35,19 @@ class LLMConfig(BaseModel):
     timeout: float = 120.0
 
 
+class BrowserConfig(BaseModel):
+    """浏览器工具（需要 pip install "No-Agent[browser]"）"""
+
+    enabled: bool = False
+    channel: str | None = "chrome"  # 使用本机已安装的浏览器：chrome / msedge；None 用 Playwright 自带 Chromium
+    headless: bool = False  # 默认显示浏览器窗口，方便看到 AI 在做什么
+    slow_mo: int = 0  # 每个操作放慢的毫秒数（调试用）
+    action_timeout: float = 10.0  # 单个页面操作的超时（秒）
+
+
 class AgentConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    browser: BrowserConfig = Field(default_factory=BrowserConfig)
 
     # ── 存储位置（见 storage/home.py 的解析规则）──
     home: Path | None = None  # 数据根目录；为空时：环境变量 NO_AGENT_HOME > 向上查找 .no-agent/ > ./.no-agent
@@ -52,8 +63,9 @@ class AgentConfig(BaseModel):
 
     # ── 执行 ──
     freeform_max_turns: int = 20
-    step_timeout: float = 60.0
+    step_timeout: float = 60.0  # 不含等待用户输入的时间
     tool_timeout: float = 60.0
+    auto_confirm: bool = False  # 需确认的操作（提交等）是否跳过确认直接执行；默认每次都问
 
     # ── 进化 ──
     distill_min_traces: int = 2  # 积累多少条相似的成功轨迹后提炼新技能

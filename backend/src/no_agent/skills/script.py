@@ -59,6 +59,8 @@ SCRIPT_API_DOC = '''
 - `ctx.state: dict` 步骤间共享的状态，请把中间结果放这里
 - `await ctx.tool(name, **args)` 调用工具，失败抛异常
 - `await ctx.llm(instruction, input=None, json=False)` 调用小模型做"需要理解"的事（抽取、分类、总结）。json=True 时返回 dict
+- `await ctx.ask(questions, title="")` 向用户提问，questions 为 [{key, label, kind: text|choice|confirm, options, required}]，一次问完所有缺失信息，返回 {key: 回答}
+- `await ctx.confirm(message)` 向用户确认一件事，返回 bool
 - `ctx.log(msg)` 记录日志
 - `ctx.fail(reason)` 主动判定失败（例如数据不符合预期），会触发 AI 接管
 
@@ -70,6 +72,8 @@ SCRIPT_API_DOC = '''
 - 机械、确定的部分写成代码；只有真正需要理解的部分才用 ctx.llm
 - 在关键处检查数据（状态码、字段是否存在），不符合预期就 ctx.fail，宁可失败交给 AI，也不要静默产出错误结果
 - 任务中会变化的值（地址、名称、数量、日期等）必须来自 ctx.params，不要硬编码
+- 标注了【需用户确认】的工具（如提交）由框架自动请求确认，脚本里不需要也不要再自己确认一遍
+- 缺少必需信息时用 ctx.ask 一次性问用户，不要编造
 
 ## 示例
 ```python
