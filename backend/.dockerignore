@@ -1,5 +1,0 @@
-.env
-.no-agent/
-.pytest_tmp/
-tests/
-**/__pycache__
