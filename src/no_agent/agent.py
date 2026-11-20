@@ -77,6 +77,7 @@ class Agent:
             stats_dir=self.home / ".stats",
             trusted_dirs=builtin_layers,
             verifier=None if cfg.untrusted_shared == "allow" else self._verify_shared,
+            untrusted_mode="shadow" if cfg.untrusted_shared == "shadow" else "block",
         )
         self.runs: RunStore = run_store or SqlRunStore(cfg.database_url or f"sqlite:///{(self.home / 'runs.db').as_posix()}")
 

@@ -1,7 +1,9 @@
 """
 技能组合：脚本里用 await ctx.skill("login", user=...) 调用另一个流程型技能
 
-- 子技能在自己的权限下运行（调用前切换到子技能声明的工具 / 域名，返回后恢复）
+- 子技能在自己声明的权限下运行（能力委托：调用方必须声明可调用它）；
+  子技能未声明的工具 / 域名不会因此放开，而是继承调用方的限制
+- 不可信的共享技能不能被调用
 - 子技能失败 → 调用它的步骤失败（父脚本整体由 AI 接管、修补）
 - 用户取消会一路向上传递
 - 嵌套深度有上限，防止循环调用
@@ -51,6 +53,8 @@ class SkillCaller:
         skill = self.store.get(skill_id)
         if skill is None or skill.status == "retired":
             raise SkillCallError(f"技能不存在或已下线: {skill_id}")
+        if skill_id in getattr(self.store, "untrusted", ()):
+            raise SkillCallError(f"{skill_id} 是不可信的共享技能（{self.store.trust.get(skill_id, '未签名')}），不能被调用")
         if skill.kind != "flow":
             raise SkillCallError(f"{skill_id} 是指南型技能，不能被脚本调用")
         return skill, self.store.script(skill_id)
@@ -66,19 +70,16 @@ class SkillCaller:
         if errors := validate_params(skill.params_schema, params):
             raise SkillCallError(f"调用 {skill_id} 的参数不合法：" + "；".join(errors))
 
-        saved = (toolbox.allowed_tools, toolbox.allowed_domains)
-        toolbox.restrict(skill.permissions.tools, skill.permissions.domains)
         child = SkillCaller(
             self.store, self.llm, step_timeout=self.step_timeout, overlay=self.overlay,
             depth=self.depth + 1, stack=self.stack + (skill_id,),
         )
-        try:
+        # 子技能在自己声明的权限下运行；未声明的部分继承调用方的限制。不修改共享的 toolbox，并发调用互不干扰
+        with toolbox.delegated(skill.permissions.tools, skill.permissions.domains):
             res = await execute_script(
                 source, task=task, params=params, toolbox=toolbox, llm=self.llm, step_timeout=self.step_timeout,
                 skills=child, skill_allowlist=skill.permissions.skills,
             )
-        finally:
-            toolbox.allowed_tools, toolbox.allowed_domains = saved
         if res.aborted:
             raise UserAbort(res.error or "用户取消")
         if not res.success:

@@ -63,8 +63,7 @@ class StepContext:
             raise StepFailure("guard 中不能调用子技能")
         if self._skills is None:
             raise StepFailure("当前环境不支持调用子技能")
-        allowed = self._toolbox.allowed_tools
-        if allowed is not None and skill_id not in self._skill_allowlist:
+        if self._toolbox.tools_restricted and skill_id not in self._skill_allowlist:
             raise StepFailure(f"技能未声明调用子技能 {skill_id}")
         try:
             return await self._skills.call(skill_id, params, toolbox=self._toolbox, task=self.task)

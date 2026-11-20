@@ -52,9 +52,27 @@ def test_sign_and_verify(tmp_path, keys):
     assert not ok and "scripts/flow_v1.py" in note
 
 
-def test_untrusted_shared_skills_are_quarantined(tmp_path, fast, strong):
+async def test_untrusted_shared_skills_are_blocked_by_default(tmp_path, fast, strong):
     shared = make_shared(tmp_path / "shared")
     agent = make_agent(tmp_path, fast, strong, extra_skill_dirs=[shared])
+    flow, guide = agent.store.get("page-title"), agent.store.get("weekly-report")
+    # 默认 block：不对外生效，也不影子运行（不执行任何不可信代码）
+    assert flow.status == "shadow" and flow.shadow is None and agent.store.trust["page-title"] == "未签名"
+    assert guide.status == "shadow" and guide.shadow is None
+    assert agent.store.untrusted == {"page-title", "weekly-report"}
+    assert agent.skills() == []
+    # 显式调用同样拒绝
+    with pytest.raises(PermissionError, match="不可信"):
+        await agent.skill("page-title").run({"url": "http://site/1"})
+
+    # install 显式信任后可用
+    agent.install_skill(shared / "page-title")
+    assert agent.store.get("page-title").status == "active" and "page-title" not in agent.store.untrusted
+
+
+def test_untrusted_shared_skills_shadow_mode(tmp_path, fast, strong):
+    shared = make_shared(tmp_path / "shared")
+    agent = make_agent(tmp_path, fast, strong, extra_skill_dirs=[shared], untrusted_shared="shadow")
     flow, guide = agent.store.get("page-title"), agent.store.get("weekly-report")
     # 流程型：进入影子运行（不对外生效，但会在本地任务上比对）
     assert flow.status == "shadow" and flow.shadow_version == 1 and agent.store.trust["page-title"] == "未签名"

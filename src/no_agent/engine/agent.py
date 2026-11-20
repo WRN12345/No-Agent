@@ -194,6 +194,9 @@ class EvolvingAgent:
             skill = self.store.get(skill_id or "")
             if skill is None:
                 raise KeyError(f"技能不存在: {skill_id}")
+            if skill.id in getattr(self.store, "untrusted", ()):
+                note = getattr(self.store, "trust", {}).get(skill.id, "未签名")
+                raise PermissionError(f"{skill.id} 是不可信的共享技能（{note}），请签名后加入 trusted_signers 或 install 显式信任")
             if params is not None:
                 if errors := validate_params(skill.params_schema, params):
                     raise ValueError(f"技能 {skill.id} 参数不合法：" + "；".join(errors))

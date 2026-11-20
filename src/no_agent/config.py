@@ -94,9 +94,10 @@ class AgentConfig(BaseModel):
     skill_repos: list[SkillRepoConfig] = []  # git 技能仓库（同步到 <home>/repos/，作为只读层）
     trusted_signers: dict[str, str] = {}  # 签名者 → Ed25519 公钥（base64）
     # 共享技能（extra_skill_dirs / skill_repos）没有可信签名时：
-    #   shadow → 流程型先影子运行、比对通过后才生效；指南型不自动使用（默认，可靠优先）
+    #   block  → 隔离：不执行、不自动使用，签名或 install 后才可用（默认，安全优先）
+    #   shadow → 流程型先影子运行、比对通过后才生效（会在本进程中执行不可信脚本）；指南型不自动使用
     #   allow  → 直接信任
-    untrusted_shared: Literal["shadow", "allow"] = "shadow"
+    untrusted_shared: Literal["block", "shadow", "allow"] = "block"
     database_url: str | None = None  # 运行记录；默认 sqlite:///<home>/runs.db，生产可用 postgresql://...
     workspace_dir: Path | None = None  # 工具工作区；默认 <home>/workspace
 

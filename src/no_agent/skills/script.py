@@ -4,8 +4,10 @@
 脚本是一个普通的 Python 文件，由若干 @step 异步函数（按定义顺序执行）和可选的 verify 函数组成。
 步骤是"修补的最小单位"：脚本在第 k 步失败时，只需要重写第 k 步。
 
-安全说明：这里的 AST 白名单 + 受限 builtins 能挡住常见误用（import os、文件读写、反射逃逸），
-但它不是强安全边界。脚本对外部世界的一切操作都应通过 ctx.tool()，
+安全说明：这里的 AST 白名单 + 受限 builtins + 模块代理能挡住常见误用和已知的逃逸手法
+（import os、经白名单模块转手拿到 os/sys、帧对象回溯、match 类模式读私有属性、
+attrgetter / Formatter 等"字符串版 getattr"），但它仍然不是强安全边界：
+脚本与框架同进程运行，死循环之类也无法被打断。不可信来源的脚本不应执行；
 真正需要强隔离时，应把执行器放到独立进程 / 容器中运行。
 """
 
@@ -13,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import types
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -22,7 +25,25 @@ ALLOWED_IMPORTS = {
     "json", "re", "math", "datetime", "time", "random", "statistics", "collections", "itertools",
     "functools", "string", "textwrap", "html", "urllib", "base64", "hashlib", "decimal",
     "fractions", "typing", "uuid", "csv", "io", "difflib", "unicodedata", "copy", "enum",
-    "dataclasses", "operator", "bisect", "heapq", "zoneinfo", "calendar",
+    "operator", "bisect", "heapq", "zoneinfo", "calendar",
+}
+# 允许的子模块（其他子模块一律不允许，例如 urllib.request 可以绕过 ctx.tool 直接联网 / 读文件）
+ALLOWED_SUBMODULES = {"urllib.parse", "collections.abc"}
+
+# 白名单模块中会破坏沙箱的成员：等价于 getattr / eval / open 的能力
+DENIED_MEMBERS: dict[str, set[str]] = {
+    "operator": {"attrgetter", "methodcaller"},
+    "string": {"Formatter"},
+    "typing": {"get_type_hints", "evaluate_forward_ref", "ForwardRef"},
+    "functools": {"singledispatch", "singledispatchmethod"},
+    "io": {"open", "open_code", "FileIO"},
+    "zoneinfo": {"reset_tzpath"},
+}
+
+# 不以下划线开头、但能拿到帧 / 全局变量（进而拿到真实 builtins）的属性
+FORBIDDEN_ATTRS = {
+    "gi_frame", "gi_code", "gi_yieldfrom", "cr_frame", "cr_code", "cr_await", "ag_frame", "ag_code", "ag_await",
+    "f_back", "f_globals", "f_locals", "f_builtins", "f_code", "tb_frame", "tb_next",
 }
 
 FORBIDDEN_NAMES = {
@@ -52,7 +73,7 @@ SCRIPT_API_DOC = '''
   返回 True 表示可以执行；返回字符串表示不适用的原因（此时一个步骤都不会执行，直接交给 AI）。
   guard 里只能调用只读工具。脚本中有不可撤销的步骤时，强烈建议写 guard
 - `step` 和 `ctx` 由运行时注入，无需 import
-- 只能 import：json, re, math, datetime, time, collections, itertools, html, urllib, base64, hashlib, csv, io, difflib 等标准库纯计算模块
+- 只能 import：json, re, math, datetime, time, collections, itertools, html, urllib.parse, base64, hashlib, csv, io, difflib 等标准库纯计算模块（只能使用模块里的函数、类、常量，不能经由它们访问其他模块）
 - 禁止 open/eval/exec/getattr、禁止访问以下划线开头的属性、禁止模块顶层执行逻辑（顶层只允许 import、常量、函数定义）
 - 对外部世界的一切操作都必须通过 `await ctx.tool(...)`
 
@@ -129,6 +150,10 @@ def _is_step_decorator(d: ast.expr) -> bool:
     return isinstance(d, ast.Call) and isinstance(d.func, ast.Name) and d.func.id == "step"
 
 
+def _module_allowed(name: str) -> bool:
+    return name in ALLOWED_SUBMODULES if "." in name else name in ALLOWED_IMPORTS
+
+
 def validate_script(source: str) -> list[str]:
     """静态校验，返回步骤名列表；不合法抛 ScriptError"""
     try:
@@ -140,17 +165,29 @@ def validate_script(source: str) -> list[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name.split(".")[0] not in ALLOWED_IMPORTS:
+                if not _module_allowed(alias.name):
                     errors.append(f"第 {node.lineno} 行: 不允许 import {alias.name}")
         elif isinstance(node, ast.ImportFrom):
-            if node.level or (node.module or "").split(".")[0] not in ALLOWED_IMPORTS:
+            if node.level or not _module_allowed(node.module or ""):
                 errors.append(f"第 {node.lineno} 行: 不允许 from {node.module} import")
+            for alias in node.names:
+                if alias.name == "*":
+                    errors.append(f"第 {node.lineno} 行: 不允许 import *")
+                elif alias.name.startswith("_") or alias.name in DENIED_MEMBERS.get(node.module or "", ()):
+                    errors.append(f"第 {node.lineno} 行: 不允许使用 {node.module}.{alias.name}")
         elif isinstance(node, ast.Name) and node.id in FORBIDDEN_NAMES:
             errors.append(f"第 {node.lineno} 行: 不允许使用 {node.id}")
         elif isinstance(node, ast.Name) and node.id.startswith("__"):
             errors.append(f"第 {node.lineno} 行: 不允许使用 {node.id}")
         elif isinstance(node, ast.Attribute) and node.attr.startswith("_"):
             errors.append(f"第 {node.lineno} 行: 不允许访问私有属性 .{node.attr}")
+        elif isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRS:
+            errors.append(f"第 {node.lineno} 行: 不允许访问 .{node.attr}")
+        elif isinstance(node, ast.MatchClass):
+            # case X(__class__=c) 等价于读取属性，同样受私有属性规则约束
+            for attr in node.kwd_attrs:
+                if attr.startswith("_") or attr in FORBIDDEN_ATTRS:
+                    errors.append(f"第 {node.lineno} 行: 不允许在模式匹配中访问 {attr}")
         elif isinstance(node, ast.ClassDef):
             errors.append(f"第 {node.lineno} 行: 不允许定义类")
 
@@ -178,10 +215,48 @@ def validate_script(source: str) -> list[str]:
     return steps
 
 
+class _ModuleProxy:
+    """
+    白名单模块的只读代理：只暴露模块自己的公开成员。
+    挡住"白名单模块转手"的逃逸（uuid.os、typing.sys ……）和 DENIED_MEMBERS 中的危险成员。
+    """
+
+    __slots__ = ("_mod",)
+
+    def __init__(self, mod: types.ModuleType) -> None:
+        object.__setattr__(self, "_mod", mod)
+
+    def __getattr__(self, name: str) -> Any:
+        mod = object.__getattribute__(self, "_mod")
+        modname = mod.__name__
+        if name.startswith("_") or name in DENIED_MEMBERS.get(modname, ()):
+            raise AttributeError(f"不允许使用 {modname}.{name}")
+        value = getattr(mod, name)
+        if isinstance(value, types.ModuleType):
+            if value.__name__ in ALLOWED_SUBMODULES and value.__name__ == f"{modname}.{name}":
+                return _ModuleProxy(value)
+            raise AttributeError(f"不允许经由 {modname} 访问模块 {value.__name__}")
+        return value
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("模块是只读的")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("模块是只读的")
+
+    def __dir__(self) -> list[str]:
+        mod = object.__getattribute__(self, "_mod")
+        return [n for n in dir(mod) if not n.startswith("_")]
+
+    def __repr__(self) -> str:
+        return f"<module {object.__getattribute__(self, '_mod').__name__!r} (sandboxed)>"
+
+
 def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):  # noqa: A002
-    if level or name.split(".")[0] not in ALLOWED_IMPORTS:
+    if level or not _module_allowed(name):
         raise ImportError(f"不允许 import {name}")
-    return builtins.__import__(name, globals, locals, fromlist, level)
+    # 返回代理：from x import y / import a.b as c 都经由代理的 __getattr__ 取成员
+    return _ModuleProxy(builtins.__import__(name, globals, locals, fromlist, level))
 
 
 def _safe_builtins() -> dict[str, Any]:

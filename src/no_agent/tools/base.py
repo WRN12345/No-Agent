@@ -14,11 +14,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import json
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 TRACE_OUTPUT_LIMIT = 4_000  # 写入轨迹 / 喂给 LLM 的输出截断长度
 FIXTURE_OUTPUT_LIMIT = 50_000  # 测试回放 fixture 的最大输出长度
@@ -142,6 +144,12 @@ class ToolRegistry:
 
 ALWAYS_ALLOWED = {"ask_user"}  # 不需要声明的工具
 
+# 子技能调用期间生效的权限：{toolbox id: (工具集合 | None, 域名列表 | None)}。
+# 用 ContextVar 保存而不是改 toolbox 的属性：并发的 ctx.skill 调用（各自在独立的 asyncio 任务中）互不影响。
+_DELEGATED: contextvars.ContextVar[dict[int, tuple[set[str] | None, list[str] | None]]] = contextvars.ContextVar(
+    "no_agent_delegated_permissions", default={}
+)
+
 
 def host_of(url: str) -> str:
     from urllib.parse import urlsplit
@@ -250,13 +258,40 @@ class Toolbox:
         self.allowed_tools = set(tools) | ALWAYS_ALLOWED if tools else None
         self.allowed_domains = list(domains) if domains else None
 
+    def effective_permissions(self) -> tuple[set[str] | None, list[str] | None]:
+        """当前生效的 (工具, 域名) 限制；None 表示不限制"""
+        return _DELEGATED.get().get(id(self), (self.allowed_tools, self.allowed_domains))
+
+    @property
+    def tools_restricted(self) -> bool:
+        """当前是否限制了可用工具（此时调用子技能也必须事先声明）"""
+        return self.effective_permissions()[0] is not None
+
+    @contextmanager
+    def delegated(self, tools: list[str] | None, domains: list[str] | None) -> Iterator[None]:
+        """
+        子技能调用：子技能在自己声明的权限下运行（能力委托——调用方必须事先声明可调用它）。
+        子技能没有声明的部分（工具或域名）不会因此放开，而是继承调用方当前的限制。
+        """
+        cur_tools, cur_domains = self.effective_permissions()
+        eff = (
+            set(tools) | ALWAYS_ALLOWED if tools else cur_tools,
+            list(domains) if domains else cur_domains,
+        )
+        token = _DELEGATED.set({**_DELEGATED.get(), id(self): eff})
+        try:
+            yield
+        finally:
+            _DELEGATED.reset(token)
+
     def check_permission(self, t: Tool, args: dict[str, Any]) -> None:
-        if self.allowed_tools is not None and t.name not in self.allowed_tools:
-            raise PermissionDenied(f"技能未声明使用工具 {t.name}（已声明: {', '.join(sorted(self.allowed_tools))}）")
-        if self.allowed_domains is not None and t.url_arg and args.get(t.url_arg):
+        tools, domains = self.effective_permissions()
+        if tools is not None and t.name not in tools:
+            raise PermissionDenied(f"技能未声明使用工具 {t.name}（已声明: {', '.join(sorted(tools))}）")
+        if domains is not None and t.url_arg and args.get(t.url_arg):
             host = host_of(str(args[t.url_arg]))
-            if not domain_allowed(host, self.allowed_domains):
-                raise PermissionDenied(f"技能未声明访问域名 {host or args[t.url_arg]}（已声明: {', '.join(self.allowed_domains)}）")
+            if not domain_allowed(host, domains):
+                raise PermissionDenied(f"技能未声明访问域名 {host or args[t.url_arg]}（已声明: {', '.join(domains)}）")
 
     async def call(self, name: str, args: dict[str, Any], step: str | None = None) -> Any:
         t = self.registry.get(name)

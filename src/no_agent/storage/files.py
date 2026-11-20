@@ -110,12 +110,15 @@ class FileSkillStore:
         stats_dir: Path | None = None,
         trusted_dirs: list[Path] | None = None,
         verifier: Callable[[Path], tuple[bool, str]] | None = None,
+        untrusted_mode: Literal["block", "shadow"] = "block",
     ) -> None:
         """
         trusted_dirs：无需验证签名的只读层（如框架内置技能）
-        verifier：只读层技能的信任检查（返回 (是否可信, 说明)）。不可信的技能：
-          流程型 → 先进入影子运行，在本地任务上比对通过后才转正（转正时复制到可写层）
-          指南型 → 不自动使用（正文会进入 AI 提示词），需要 install 显式信任
+        verifier：只读层技能的信任检查（返回 (是否可信, 说明)）。不可信的技能一律不对外生效，
+          也不能被其他技能 ctx.skill() 调用；需要签名或 install 显式信任。
+        untrusted_mode：不可信流程型技能的处理
+          block  → 完全不执行（默认）。脚本在进程内执行，沙箱不是强安全边界，执行即等于信任
+          shadow → 在本地任务上影子运行、比对通过后转正（会在本进程中执行不可信代码，仅适用于来源基本可信的场景）
         verifier 为 None 时只读层全部视为可信
         """
         self.root = Path(root)
@@ -123,6 +126,8 @@ class FileSkillStore:
         self.trusted_dirs = {Path(d).resolve() for d in (trusted_dirs or [])}
         self.verifier = verifier
         self.trust: dict[str, str] = {}  # 只读层技能的信任说明
+        self.untrusted: set[str] = set()  # 未通过信任检查的只读层技能
+        self.untrusted_mode = untrusted_mode
         self.stats_dir = Path(stats_dir) if stats_dir else self.root.parent / ".stats"
         self.root.mkdir(parents=True, exist_ok=True)
         self.stats_dir.mkdir(parents=True, exist_ok=True)
@@ -139,6 +144,7 @@ class FileSkillStore:
             self._cache.clear()
             self._origin.clear()
             self._legacy.clear()
+            self.untrusted.clear()
             for layer in [*self.readonly_dirs, self.root]:  # 后加载的覆盖先加载的
                 if not layer.is_dir():
                     logger.warning("技能目录不存在，跳过: %s", layer)
@@ -158,11 +164,14 @@ class FileSkillStore:
                             self._legacy.add(skill.id)
                     skill.stats = self._load_stats(skill.id)
                     self.trust.pop(skill.id, None)
+                    self.untrusted.discard(skill.id)
                     if layer != self.root and self.verifier and layer.resolve() not in self.trusted_dirs:
                         ok, note = self.verifier(d)
                         self.trust[skill.id] = note
-                        if not ok and skill.status == "active":
-                            self._quarantine(skill, note)
+                        if not ok:
+                            self.untrusted.add(skill.id)
+                            if skill.status == "active":
+                                self._quarantine(skill, note, run_shadow=self.untrusted_mode == "shadow")
                     self._cache[skill.id] = skill
                     self._origin[skill.id] = d
 
@@ -188,12 +197,16 @@ class FileSkillStore:
         return d
 
     @staticmethod
-    def _quarantine(skill: Skill, note: str) -> None:
+    def _quarantine(skill: Skill, note: str, *, run_shadow: bool) -> None:
         """不可信的共享技能：仅在内存中改为影子状态（共享库本身不会被修改）"""
-        logger.info("共享技能 %s 不可信（%s），先进入影子运行", skill.id, note)
         skill.status = "shadow"
-        if skill.kind == "flow" and skill.shadow is None:
-            skill.shadow = ShadowState(version=skill.active_version)
+        if run_shadow and skill.kind == "flow":
+            logger.warning("共享技能 %s 不可信（%s），进入影子运行（会在本进程中执行其脚本）", skill.id, note)
+            if skill.shadow is None:
+                skill.shadow = ShadowState(version=skill.active_version)
+        else:
+            logger.info("共享技能 %s 不可信（%s），已隔离：不会执行，签名或 install 后才可使用", skill.id, note)
+            skill.shadow = None
 
     def _load_stats(self, skill_id: str) -> SkillStats:
         p = self.stats_dir / f"{skill_id}.json"
@@ -310,6 +323,7 @@ class FileSkillStore:
     def _activate(self, skill: Skill, version: int) -> None:
         old = skill.active_version
         self.trust.pop(skill.id, None)  # 转正后成为本地技能
+        self.untrusted.discard(skill.id)
         if old and old != version and skill.guide:  # 正文里引用的脚本路径跟着更新
             skill.guide = skill.guide.replace(script_relpath(old), script_relpath(version))
         elif not old and skill.guide and script_relpath(version) not in skill.guide:  # 指南型升级为流程型
