@@ -1,89 +1,21 @@
 """
-技能执行器：逐步执行脚本，失败时精确报告"哪一步、什么错、当时的状态"，供 AI 接管和修补使用
+技能执行编排：逐阶段执行脚本（guard → 各步骤 → verify），失败时精确报告"哪一步、什么错、当时的状态"，
+供 AI 接管和修补使用。
+
+编排（顺序、计时、超时、记录、归因）始终在宿主；脚本在哪里执行由 Runner 决定（见 skills/runner.py）。
 """
 
 from __future__ import annotations
 
 import asyncio
-import inspect
-import json
 import time
-import traceback
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable
 
-from no_agent.llm import BaseLLM, parse_json
-from no_agent.skills.script import SCRIPT_FILENAME, ScriptError, load_script
-from no_agent.tools.base import Toolbox, ToolError, UserAbort, to_jsonable, truncate
-
-
-GUARD_STEP = "<guard>"
-
-
-class StepFailure(Exception):
-    """脚本主动判定失败（ctx.fail）"""
-
-
-class StepContext:
-    """注入给每个步骤的 ctx"""
-
-    def __init__(self, *, task: str, params: dict[str, Any], toolbox: Toolbox, llm: BaseLLM, skills: Any = None) -> None:
-        self.task = task
-        self.params = params
-        self.state: dict[str, Any] = {}
-        self.result: Any = None
-        self.logs: list[str] = []
-        self._toolbox = toolbox
-        self._llm = llm
-        self._skills = skills  # SkillCaller；None 表示当前环境不支持调用子技能
-        self._skill_allowlist: set[str] = set()
-        self._step: str | None = None
-
-    async def tool(self, name: str, **args: Any) -> Any:
-        if self._step == GUARD_STEP:
-            t = self._toolbox.registry.get(name)
-            if t is not None and (t.has_side_effect(args) or t.needs_confirm(args) or t.interactive):
-                raise StepFailure(f"guard 中只能调用只读工具，不能调用 {name}")
-        return await self._toolbox.call(name, args, step=self._step)
-
-    async def llm(self, instruction: str, input: Any = None, *, json: bool = False) -> Any:  # noqa: A002
-        content = instruction
-        if input is not None:
-            content += "\n\n输入:\n" + (input if isinstance(input, str) else _dumps(input))
-        if json:
-            content += "\n\n只输出一个 JSON 对象。"
-        reply = await self._llm.complete([{"role": "user", "content": content}], purpose="script_llm")
-        return parse_json(reply.content) if json else reply.content.strip()
-
-    async def skill(self, skill_id: str, **params: Any) -> Any:
-        """调用另一个流程型技能（在它自己的权限下运行），返回它的结果；失败时本步骤失败"""
-        from no_agent.skills.compose import SkillCallError
-
-        if self._step == GUARD_STEP:
-            raise StepFailure("guard 中不能调用子技能")
-        if self._skills is None:
-            raise StepFailure("当前环境不支持调用子技能")
-        if self._toolbox.tools_restricted and skill_id not in self._skill_allowlist:
-            raise StepFailure(f"技能未声明调用子技能 {skill_id}")
-        try:
-            return await self._skills.call(skill_id, params, toolbox=self._toolbox, task=self.task)
-        except SkillCallError as e:
-            raise StepFailure(str(e)) from e
-
-    async def ask(self, questions: list[dict[str, Any]], title: str = "") -> dict[str, Any]:
-        """一次性向用户提出多个问题，返回 {key: 回答}"""
-        return await self.tool("ask_user", questions=questions, title=title)
-
-    async def confirm(self, message: str) -> bool:
-        """向用户确认一件事，返回是否同意"""
-        out = await self.ask([{"key": "ok", "label": message, "kind": "confirm"}], title="需要你确认")
-        return bool(out.get("ok"))
-
-    def log(self, msg: Any) -> None:
-        self.logs.append(f"[{self._step}] {msg}")
-
-    def fail(self, reason: str) -> None:
-        raise StepFailure(reason)
+from no_agent.llm import BaseLLM
+from no_agent.skills.runner import IN_PROCESS, CtxBridge, ScriptRunner, ScriptSession
+from no_agent.skills.sandbox import GUARD_STEP, VERIFY_STEP, PhaseOutcome, ScriptError, StepFailure  # noqa: F401
+from no_agent.tools.base import Toolbox
 
 
 @dataclass
@@ -120,24 +52,8 @@ class ExecutionResult:
         }
 
 
-def _dumps(obj: Any) -> str:
-    return json.dumps(obj, ensure_ascii=False, default=str)
-
-
-def _format_exc(e: BaseException) -> str:
-    """异常信息 + 脚本内的出错行号（帮助 LLM 精确定位）"""
-    frames = [f for f in traceback.extract_tb(e.__traceback__) if f.filename == SCRIPT_FILENAME]
-    where = f"（脚本第 {frames[-1].lineno} 行）" if frames else ""
-    return f"{type(e).__name__}: {e}{where}"
-
-
-async def _as_coro(fn: Any, ctx: Any) -> Any:
-    v = fn(ctx)
-    return await v if inspect.isawaitable(v) else v
-
-
-async def _run_step(coro: Any, toolbox: Toolbox, timeout: float) -> Any:
-    """执行一个步骤；超时只计算"自己在忙"的时间，等待用户输入的时间不算"""
+async def _run_step(coro: Awaitable[Any], toolbox: Toolbox, timeout: float) -> Any:
+    """执行一个阶段；超时只计算"自己在忙"的时间，等待用户输入的时间不算。超时后取消该阶段"""
     task = asyncio.ensure_future(coro)
     start, waited0 = time.perf_counter(), toolbox.waited_total()
     while True:
@@ -165,84 +81,76 @@ async def execute_script(
     step_timeout: float = 60.0,
     skills: Any = None,
     skill_allowlist: list[str] | None = None,
+    runner: ScriptRunner | None = None,
 ) -> ExecutionResult:
     """
     skills：SkillCaller，提供 ctx.skill()；skill_allowlist：本技能声明可调用的子技能
-    （仅在 toolbox 有工具限制时生效）
+    （仅在 toolbox 有工具限制时生效）；runner：脚本在哪里执行，默认进程内
     """
+    bridge = CtxBridge(toolbox=toolbox, llm=llm, task=task, skills=skills, skill_allowlist=skill_allowlist)
     try:
-        loaded = load_script(source)
+        session = await (runner or IN_PROCESS).open(source, task=task, params=params, bridge=bridge)
     except ScriptError as e:
         return ExecutionResult(success=False, failed_step="<load>", error=str(e))
+    try:
+        return await _orchestrate(session, bridge, toolbox, step_timeout)
+    finally:
+        await session.close()
 
-    ctx = StepContext(task=task, params=params, toolbox=toolbox, llm=llm, skills=skills)
-    ctx._skill_allowlist = set(skill_allowlist or [])
-    res = ExecutionResult(success=False, all_steps=[s.name for s in loaded.steps])
+
+async def _orchestrate(session: ScriptSession, bridge: CtxBridge, toolbox: Toolbox, timeout: float) -> ExecutionResult:
+    res = ExecutionResult(success=False, all_steps=[s.name for s in session.steps])
+
+    async def phase(kind: Any, name: str, step: str) -> PhaseOutcome:
+        bridge.step = step  # 宿主设置当前阶段：guard 的只读限制、工具调用录制都以此为准
+        try:
+            return await _run_step(session.run(kind, name), toolbox, timeout)
+        except asyncio.TimeoutError:
+            return PhaseOutcome("timeout")
 
     def finish(ok: bool, step: str | None = None, error: str | None = None) -> ExecutionResult:
+        snap = session.snapshot()
         res.success, res.failed_step, res.error = ok, step, error
-        res.result = to_jsonable(ctx.result)
-        res.state = {k: truncate(to_jsonable(v), 1500) for k, v in ctx.state.items()}
-        res.logs = ctx.logs
+        res.result, res.state, res.logs = snap.result, snap.state, snap.logs
         return res
 
-    if loaded.guard is not None:
-        ctx._step = GUARD_STEP
-        try:
-            g = await _run_step(_as_coro(loaded.guard, ctx), toolbox, step_timeout)
-        except UserAbort as e:
-            res.aborted = True
-            return finish(False, GUARD_STEP, f"用户取消: {e}")
-        except asyncio.TimeoutError:
-            g = f"前置检查超时（{step_timeout}s）"
-        except StepFailure as e:
-            g = str(e)
-        except ToolError as e:
-            g = f"工具调用失败: {e}"
-        except Exception as e:  # noqa: BLE001
-            g = f"前置检查出错: {_format_exc(e)}"
-        if g is not True and g is not None:
-            res.guard_rejected = True
-            return finish(False, GUARD_STEP, f"前置检查未通过: {g if isinstance(g, str) else '返回 False'}")
+    # ── 前置检查 ──
+    out = await phase("guard", GUARD_STEP, GUARD_STEP)
+    if out.status == "abort":
+        res.aborted = True
+        return finish(False, GUARD_STEP, f"用户取消: {out.message}")
+    if out.status != "ok":
+        reason = f"前置检查超时（{timeout}s）" if out.status == "timeout" else out.message
+        res.guard_rejected = True
+        return finish(False, GUARD_STEP, f"前置检查未通过: {reason}")
 
-    for s in loaded.steps:
-        ctx._step = s.name
+    # ── 步骤 ──
+    for meta in session.steps:
         t0 = time.perf_counter()
-        error: str | None = None
-        try:
-            ret = await _run_step(s.func(ctx), toolbox, step_timeout)
-            if ret is not None:
-                ctx.result = ret
-        except UserAbort as e:
-            res.steps.append(StepRecord(name=s.name, ok=False, ms=int((time.perf_counter() - t0) * 1000), idempotent=s.idempotent, error=str(e)))
-            res.aborted = True
-            return finish(False, s.name, f"用户取消: {e}")
-        except StepFailure as e:
-            error = f"主动失败: {e}"
-        except ToolError as e:
-            error = f"工具调用失败: {e}"
-        except asyncio.TimeoutError:
-            error = f"步骤超时（{step_timeout}s）"
-        except Exception as e:  # noqa: BLE001
-            error = _format_exc(e)
+        out = await phase("step", meta.name, meta.name)
         ms = int((time.perf_counter() - t0) * 1000)
-        res.steps.append(StepRecord(name=s.name, ok=error is None, ms=ms, idempotent=s.idempotent, error=error))
+        if out.status == "abort":
+            res.steps.append(StepRecord(name=meta.name, ok=False, ms=ms, idempotent=meta.idempotent, error=out.message))
+            res.aborted = True
+            return finish(False, meta.name, f"用户取消: {out.message}")
+        error = {
+            "ok": None,
+            "fail": f"主动失败: {out.message}",
+            "tool_error": f"工具调用失败: {out.message}",
+            "timeout": f"步骤超时（{timeout}s）",
+        }.get(out.status, out.message)
+        res.steps.append(StepRecord(name=meta.name, ok=error is None, ms=ms, idempotent=meta.idempotent, error=error))
         if error:
-            return finish(False, s.name, error)
+            return finish(False, meta.name, error)
 
-    ctx._step = "verify"
-    if loaded.verify is not None:
-        try:
-            v = loaded.verify(ctx, ctx.result)
-            if inspect.isawaitable(v):
-                v = await v
-        except Exception as e:  # noqa: BLE001
-            return finish(False, "verify", f"verify 出错: {_format_exc(e)}")
-        if v is False:
-            return finish(False, "verify", "verify 未通过")
-        if isinstance(v, str):
-            return finish(False, "verify", f"verify 未通过: {v}")
-    elif ctx.result is None:
-        return finish(False, "verify", "脚本没有产生结果")
-
-    return finish(True)
+    # ── 结果校验 ──
+    out = await phase("verify", VERIFY_STEP, VERIFY_STEP)
+    if out.status == "ok":
+        return finish(True)
+    if out.status == "no_result":
+        return finish(False, VERIFY_STEP, "脚本没有产生结果")
+    if out.status == "timeout":
+        return finish(False, VERIFY_STEP, f"verify 超时（{timeout}s）")
+    if out.status == "rejected":
+        return finish(False, VERIFY_STEP, f"verify 未通过: {out.message}" if out.message else "verify 未通过")
+    return finish(False, VERIFY_STEP, f"verify 出错: {out.message}")
