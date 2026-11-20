@@ -66,6 +66,7 @@ class SkillSummary(BaseModel):
     name: str
     description: str
     status: str
+    kind: str  # flow：带流程脚本 | guide：纯 SKILL.md 指南
     layer: str  # local：本项目技能库 | shared：只读共享库
     active_version: int
     versions: int
@@ -75,6 +76,11 @@ class SkillSummary(BaseModel):
     recent_success_rate: float | None
     takeovers: int
     updated_at: datetime
+
+
+class SkillRunRequest(BaseModel):
+    params: dict[str, Any] | None = Field(None, description="技能参数（按 params_schema 校验）；不给则从 task 中抽取")
+    task: str | None = Field(None, description="任务描述（可选）")
 
 
 class VersionRequest(BaseModel):

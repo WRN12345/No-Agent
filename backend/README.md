@@ -42,12 +42,51 @@ agent = Agent(
 
 async with agent:                                  # 启动后台进化器；退出时等待进化任务完成
     run = await agent.run("查一下所有待发货的订单")
-    print(run.mode, run.result)                    # mode: skill / skill_takeover / freeform
+    print(run.mode, run.result)                    # mode: skill / skill_takeover / guide / freeform / aborted
 
 run = agent.run_sync("查一下所有待发货的订单")      # 同步代码中使用
 ```
 
 也可以从环境变量读配置：`Agent(AgentConfig.from_env())`，变量见 [.env.example](.env.example)（前缀 `NO_AGENT_`）。
+
+### 显式调用技能
+
+自然语言 `agent.run(...)` 每次都要先匹配技能。已经知道要用哪个技能时，直接调用更快，行为也完全可预期：
+
+```python
+run = await agent.skill("fill-form").run({"url": "https://...", "data": {"姓名": "张三"}})  # 跳过匹配，零匹配开销
+run = await agent.skill("fill-form").run(task="帮我填 https://... 我叫张三")              # 只给任务：小模型抽取参数
+```
+
+`params` 会按技能的 `params_schema` 校验（必填项、类型），不合法直接抛 `ValueError`，不会带着错误参数开跑。
+
+## 技能格式（兼容 Anthropic Agent Skills）
+
+每个技能是一个目录，**SKILL.md 是标准格式**，可以原样放进 Claude Code、Codex 等工具使用：
+
+```
+fill-form/
+  SKILL.md            标准 frontmatter（name / description）+ 正文：给 AI 或人看的操作指南
+  no-agent.json       本框架的扩展数据：参数 schema、版本历史、状态、权限声明
+  scripts/flow_v1.py  流程脚本（可直接执行；修补后产生 flow_v2.py ...）
+  tests/cases.json    回归用例（录制的工具调用与问答）
+```
+
+两种技能：
+
+| 类型 | 构成 | 命中后 |
+|---|---|---|
+| **流程型**（flow） | SKILL.md + no-agent.json + scripts | 直接执行脚本；失败时 AI 从失败步骤接管，后台修补 |
+| **指南型**（guide） | 只有 SKILL.md（例如第三方的 Anthropic Skill） | 把正文注入 AI 的提示词，AI 照着做（`mode="guide"`） |
+
+```python
+agent.install_skill("path/to/some-skill")          # 安装（复制到本项目，先校验 SKILL.md 和所有脚本）
+AgentConfig(extra_skill_dirs=["/team/skills"])     # 或以只读方式挂载团队 / 第三方技能库（git 仓库即可）
+```
+
+- 写回 SKILL.md 时只更新 `name` / `description`，**保留其他 frontmatter 字段和正文**
+- 提炼新技能时，强模型会同时写出正文指南，所以学到的技能脱离本框架也能被其他 Agent 使用
+- 旧格式（`manifest.json` + `vN.py`）加载时自动迁移
 
 ## 浏览器与人机交互
 
@@ -118,7 +157,7 @@ open_page → snapshot（一次读出全部字段：标签/类型/必填/选项/
 
 **分层与写时复制**：只读层的技能被修补、切换版本或下线时，会先整体复制到可写层再修改，共享库本身不会被改动。只是"用了一下"只记统计，不会触发复制。
 
-**结构版本**：技能清单和数据库都记录 `schema_version`。框架升级时如果存储结构有变化，会在 `storage/sql.py` 的 `MIGRATIONS` 中登记迁移，启动时自动执行；遇到比框架更新的数据会拒绝加载，避免旧版本写坏新数据。
+**结构版本**：技能目录（当前 v2）和运行记录库（当前 v1）各自记录 `schema_version`，分别迁移：技能旧格式在加载时自动改写，数据库迁移登记在 `storage/sql.py` 的 `MIGRATIONS` 中、启动时执行。遇到比框架更新的数据会拒绝加载，避免旧版本写坏新数据。
 
 ## 作为服务使用
 
@@ -139,7 +178,8 @@ docker compose up                  # 见 ../docker-compose.yml，数据在 /data
 | POST | `/api/v1/run` | 执行任务；`mode=freeform` 强制 AI 做，`mode=skill` + `skill_id` 指定技能 |
 | GET | `/api/v1/runs`、`/api/v1/runs/{id}` | 运行记录与完整轨迹 |
 | POST | `/api/v1/feedback` | 反馈 `{run_id, score: -1~1, comment}` |
-| GET | `/api/v1/skills`、`/api/v1/skills/{id}` | 技能列表 / 详情（含脚本源码、所在层） |
+| GET | `/api/v1/skills`、`/api/v1/skills/{id}` | 技能列表 / 详情（含类型、所在层、指南正文、脚本源码） |
+| POST | `/api/v1/skills/{id}/run` | 显式调用技能 `{params}` 或 `{task}`，参数不合法返回 422 |
 | POST | `/api/v1/skills/{id}/activate` | 切换 / 回滚版本 `{version}` |
 | POST | `/api/v1/skills/{id}/retire`，DELETE `/api/v1/skills/{id}` | 下线 / 删除（只读层技能不能删） |
 | GET | `/api/v1/evolver` | 后台进化任务队列与历史（含每次进化消耗的 token） |
@@ -155,18 +195,19 @@ docker compose up                  # 见 ../docker-compose.yml，数据在 /data
 | `src/no_agent/engine/freeform.py` | 自由执行 / 接管（工具调用循环） |
 | `src/no_agent/engine/evolver.py` | 后台进化器：提炼（distill）、修补（patch）、反馈修补（feedback） |
 | `src/no_agent/engine/testing.py` | 上线门禁：录制回放测试 |
+| `src/no_agent/skills/skillmd.py` | SKILL.md 解析、校验、渲染 |
 | `src/no_agent/skills/script.py` | 脚本格式、AST 安全校验、按函数修补、`SCRIPT_API_DOC` |
 | `src/no_agent/skills/runtime.py` | 逐步执行器，精确报告失败步骤、错误行号、当时状态 |
 | `src/no_agent/skills/matcher.py` | 本地召回（向量 / 词法）+ 小模型判定与参数抽取 |
 | `src/no_agent/storage/` | 存储协议、分层文件技能库、SQL 运行记录、home 解析 |
 | `src/no_agent/tools/` | 工具层；内置 calculator / http_request / 文件读写 / current_time；`browser.py` 浏览器工具 |
 | `src/no_agent/interact.py` | 提问与确认：`Asker` 协议、终端实现、`ask_user` 工具 |
-| `src/no_agent/builtin_skills/` | 随框架分发的只读技能（`fill_form`） |
+| `src/no_agent/builtin_skills/` | 随框架分发的只读技能（`fill-form`） |
 | `src/no_agent/server/` | 可选 HTTP 服务 |
 
 ## 关键设计
 
-- **技能 = 脚本 + 参数 schema + verify + 回归用例 + 版本历史**。脚本是人类可读的 `.py`，可以直接手改。
+- **技能 = SKILL.md 指南 + 脚本 + 参数 schema + verify + 回归用例 + 版本历史**。全部是人类可读的文件，可以直接手改。
 - **步骤是修补的最小单位**。失败时只把出错的步骤、错误、状态、接管过程交给强模型，只重写那一个函数。
 - **verify 防止"静默错误"**。脚本成功但 verify 不通过同样触发接管；用户负反馈会触发修补并加强 verify。
 - **测试门禁才自动上线**：新版本必须通过新用例，且历史用例通过率 ≥ `promote_min_pass_rate`；不通过会带着失败信息重试，仍不过则不上线。
@@ -182,4 +223,13 @@ docker compose up                  # 见 ../docker-compose.yml，数据在 /data
 - **命名空间（多租户）**：尚未支持，计划后续加入，届时通过 `schema_version` 迁移已有数据。
 - **共享技能的上游更新**：技能一旦复制到本地，本地版本优先，不会自动合并上游更新。
 - **浏览器**：每个 Agent 共用一个页面，暂不支持多标签页、文件上传、验证码；`run_sync` 每次调用结束都会关闭浏览器。
-- **待做**：技能合并（重叠去重）、`kind="llm"` 步骤稳定后自动固化成代码、技能组合、健康度看板。
+- **权限声明**：`no-agent.json` 的 `permissions` 目前只是声明，尚未强制检查（阶段 2）。
+
+## 路线图（方案二：分层编译）
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| 1 | SKILL.md 格式适配、指南型技能、安装、显式调用 | ✅ 完成 |
+| 2 | 前置检查（guard）、影子运行后自动转正、权限强制检查 | 待做 |
+| 3 | MCP 服务端 / 客户端、接入 browser-use 作为 AI 浏览层 | 待做 |
+| 4 | L1 原子技能层、按热度升级（指南 → 脚本）、多候选提炼、git 技能仓库 + 签名 | 待做 |

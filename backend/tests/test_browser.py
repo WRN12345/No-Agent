@@ -68,7 +68,7 @@ async def browser_ok(tmp_path, fast, strong):
 def setup_fill_form(fast, url):
     fast.on(
         "match",
-        lambda m, t: json_reply({"skill_id": "fill_form", "confidence": 0.9, "params": {"url": url, "data": "姓名张三，技术部"}}),
+        lambda m, t: json_reply({"skill_id": "fill-form", "confidence": 0.9, "params": {"url": url, "data": "姓名张三，技术部"}}),
     )
     fast.on("script_llm", lambda m, t: json_reply({"values": {"#name": "张三", 'select[name="dept"]': "技术部"}, "submit": "#submit-btn"}))
 
@@ -121,7 +121,7 @@ async def test_fill_form_asks_once_confirms_and_submits(tmp_path, fast, strong, 
 
         # 带问答的运行可以离线回放：不弹问题、不真的提交
         case = TestCase(task=run.task, params=run.trace["match"]["params"], fixtures=run.trace["fixtures"])
-        report = await run_tests(agent.store.script("fill_form"), [case], registry=agent.registry, llm=fast)
+        report = await run_tests(agent.store.script("fill-form"), [case], registry=agent.registry, llm=fast)
         assert report.passed == 1, report.failures
         assert len(asker.asked) == 1 and len(asker.confirmations) == 1
 
@@ -134,7 +134,7 @@ async def test_declined_confirmation_aborts_without_evolving(tmp_path, fast, str
         assert run.mode == "aborted" and not run.success and "用户取消" in run.error
         assert strong.calls == []  # 没有触发 AI 接管
         assert agent.evolver.queue.qsize() == 0  # 没有触发修补
-        assert agent.store.get("fill_form").stats.runs == 0  # 不计入技能统计
+        assert agent.store.get("fill-form").stats.runs == 0  # 不计入技能统计
         page = await agent.browser.page()
         assert await page.inner_text("#result") == ""  # 确实没有提交
 

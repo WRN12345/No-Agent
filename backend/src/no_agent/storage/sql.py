@@ -17,7 +17,7 @@ from sqlalchemy import Column, Text
 from sqlalchemy.engine import Engine
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
-from no_agent.storage.base import SCHEMA_VERSION
+from no_agent.storage.base import RUNS_SCHEMA_VERSION as SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 

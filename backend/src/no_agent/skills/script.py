@@ -257,6 +257,16 @@ def replace_functions(source: str, replacements: dict[str, str]) -> str:
     return result
 
 
+def step_docs(source: str) -> list[tuple[str, str]]:
+    """[(步骤名, docstring 第一行)]，用于生成 SKILL.md 正文"""
+    out = []
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.AsyncFunctionDef) and any(_is_step_decorator(d) for d in node.decorator_list):
+            doc = (ast.get_docstring(node) or "").strip().splitlines()
+            out.append((node.name, doc[0] if doc else ""))
+    return out
+
+
 def numbered(source: str) -> str:
     """带行号的源码（给 LLM 定位错误用）"""
     return "\n".join(f"{i:>3} | {line}" for i, line in enumerate(source.splitlines(), 1))

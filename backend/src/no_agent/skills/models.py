@@ -65,33 +65,80 @@ class SkillStats(BaseModel):
         return sum(self.recent) / len(self.recent) if self.recent else None
 
 
+_JSON_TYPES: dict[str, tuple[type, ...]] = {
+    "string": (str,),
+    "integer": (int,),
+    "number": (int, float),
+    "boolean": (bool,),
+    "object": (dict,),
+    "array": (list,),
+}
+
+
+def validate_params(schema: dict[str, Any], params: dict[str, Any]) -> list[str]:
+    """轻量参数校验（必填 + 顶层类型），返回错误列表"""
+    errors = [f"缺少必填参数 {k}" for k in schema.get("required", []) if params.get(k) in (None, "")]
+    props = schema.get("properties", {})
+    for k, v in params.items():
+        t = (props.get(k) or {}).get("type")
+        if v is None or t not in _JSON_TYPES:
+            continue
+        if isinstance(v, bool) and t in ("integer", "number"):
+            errors.append(f"参数 {k} 应为 {t}")
+        elif not isinstance(v, _JSON_TYPES[t]):
+            errors.append(f"参数 {k} 应为 {t}，实际是 {type(v).__name__}")
+    return errors
+
+
+class Permissions(BaseModel):
+    """技能声明自己会用到什么（共享技能的安全边界，后续阶段据此做强制检查）"""
+
+    tools: list[str] = []  # 用到的工具；空表示未声明
+    domains: list[str] = []  # 会访问的域名
+
+
 class Skill(BaseModel):
-    schema_version: int = 1
-    id: str
-    name: str
+    """
+    一个技能 = 一个 SKILL.md 目录：
+      SKILL.md         标准格式（name / description + 正文指南），可直接给 Claude Code / Codex 等使用
+      no-agent.json    本框架的扩展数据（参数、版本、状态、权限）
+      scripts/         flow_vN.py：各版本的流程脚本
+      tests/cases.json 回归用例
+    没有流程脚本的技能是"指南型"（kind=guide）：命中后把正文注入 AI 的提示词，由 AI 照着做
+    """
+
+    schema_version: int = 2
+    id: str  # = SKILL.md 的 name（小写字母、数字、连字符）
+    name: str  # 展示名
     description: str
     when_to_use: str = ""
     keywords: list[str] = []
     params_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
+    permissions: Permissions = Field(default_factory=Permissions)
     status: Literal["active", "retired"] = "active"
-    active_version: int = 1
+    active_version: int = 0  # 0 = 没有流程脚本（指南型）
     versions: list[VersionInfo] = []
+    guide: str = ""  # SKILL.md 正文（L3 指南）
     tests: list[TestCase] = []
     stats: SkillStats = Field(default_factory=SkillStats)
     created_at: datetime = Field(default_factory=_now)
     updated_at: datetime = Field(default_factory=_now)
 
+    @property
+    def kind(self) -> Literal["flow", "guide"]:
+        return "flow" if self.versions and self.active_version > 0 else "guide"
+
     def search_text(self) -> str:
-        return " ".join([self.name, self.description, self.when_to_use, " ".join(self.keywords)])
+        return " ".join([self.id, self.name, self.description, self.when_to_use, " ".join(self.keywords)])
 
     def card(self) -> dict[str, Any]:
         """给匹配器的精简描述（控制 token）"""
-        return {
-            "id": self.id,
-            "description": self.description,
-            "when_to_use": self.when_to_use,
-            "params_schema": self.params_schema,
-        }
+        card: dict[str, Any] = {"id": self.id, "description": self.description}
+        if self.when_to_use:
+            card["when_to_use"] = self.when_to_use
+        if self.params_schema.get("properties"):
+            card["params_schema"] = self.params_schema
+        return card
 
     def missing_params(self, params: dict[str, Any]) -> list[str]:
         required = self.params_schema.get("required", [])

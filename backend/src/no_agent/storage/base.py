@@ -9,13 +9,17 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from no_agent.skills.models import Skill, TestCase
     from no_agent.storage.sql import Run
 
-SCHEMA_VERSION = 1  # 存储结构版本；变更结构时 +1 并在 migrations 中提供迁移
+# 存储结构版本：变更结构时 +1 并提供迁移
+SKILL_SCHEMA_VERSION = 2  # 技能目录格式（1：manifest.json + vN.py；2：SKILL.md 格式）
+RUNS_SCHEMA_VERSION = 1  # 运行记录库（迁移见 storage/sql.py 的 MIGRATIONS）
+SCHEMA_VERSION = SKILL_SCHEMA_VERSION  # 兼容旧名
 
 
 @runtime_checkable
@@ -25,6 +29,7 @@ class SkillStore(Protocol):
     def get(self, skill_id: str) -> Skill | None: ...
     def script(self, skill_id: str, version: int | None = None) -> str: ...
     def layer(self, skill_id: str) -> Literal["local", "shared"]: ...
+    def install(self, src: Path, *, overwrite: bool = False) -> Skill: ...
 
     def create(self, skill: Skill, script: str, *, reason: str, pass_rate: float | None = None) -> Skill: ...
     def add_version(self, skill_id: str, script: str, *, reason: str, pass_rate: float | None) -> Skill: ...

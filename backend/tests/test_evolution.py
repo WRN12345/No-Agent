@@ -83,7 +83,7 @@ async def test_full_evolution_loop(agent, fast, strong, web):
             {
                 "skip": False,
                 "use": [1, 2],
-                "id": "page_title",
+                "id": "page-title",
                 "name": "获取网页标题",
                 "description": "抓取指定网页并提取 <title> 标题",
                 "when_to_use": "用户要获取某个网址的网页标题",
@@ -98,12 +98,12 @@ async def test_full_evolution_loop(agent, fast, strong, web):
     await ev.drain()
     assert r2.mode == "freeform"
     assert ev.history[-1]["status"] == "created", ev.history[-1]
-    skill = agent.store.get("page_title")
+    skill = agent.store.get("page-title")
     assert skill and skill.active_version == 1 and len(skill.tests) == 2
-    assert agent.runs.get(r1.id).distilled_into == "page_title"
+    assert agent.runs.get(r1.id).distilled_into == "page-title"
 
     # ── 3. 直接命中技能，强模型零调用 ──
-    fast.on("match", lambda m, t: json_reply({"skill_id": "page_title", "confidence": 0.95, "params": {"url": _url(m)}}))
+    fast.on("match", lambda m, t: json_reply({"skill_id": "page-title", "confidence": 0.95, "params": {"url": _url(m)}}))
     strong_calls_before = len(strong.calls)
     r3 = await agent.run("获取 http://site/3 的网页标题")
     assert r3.mode == "skill" and r3.success and r3.result == {"title": "Page 3"}
@@ -125,10 +125,10 @@ async def test_full_evolution_loop(agent, fast, strong, web):
     assert r4.mode == "skill_takeover" and r4.success and r4.result == {"title": "Page 4"}
     await ev.drain()
     assert ev.history[-1]["status"] == "promoted", ev.history[-1]
-    skill = agent.store.get("page_title")
+    skill = agent.store.get("page-title")
     assert skill.active_version == 2 and len(skill.tests) == 3
     assert skill.stats.takeovers == 1
-    assert "def fetch" in agent.store.script("page_title", 2)  # 未出错的步骤原样保留
+    assert "def fetch" in agent.store.script("page-title", 2)  # 未出错的步骤原样保留
 
     # ── 5. v2 独立完成同类改版页面 ──
     web.pages["http://site/5"] = "<TITLE>Page 5</TITLE>"
@@ -148,7 +148,7 @@ async def test_patch_rejected_when_tests_fail(agent, fast, strong, web):
         lambda m, t: json_reply(
             {
                 "use": [1, 2],
-                "id": "page_title",
+                "id": "page-title",
                 "name": "t",
                 "description": "获取网页标题",
                 "params_schema": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
@@ -161,7 +161,7 @@ async def test_patch_rejected_when_tests_fail(agent, fast, strong, web):
     await agent.run("获取 http://site/2 的网页标题")
     await ev.drain()
 
-    fast.on("match", lambda m, t: json_reply({"skill_id": "page_title", "confidence": 0.9, "params": {"url": _url(m)}}))
+    fast.on("match", lambda m, t: json_reply({"skill_id": "page-title", "confidence": 0.9, "params": {"url": _url(m)}}))
     strong.on("takeover", lambda m, t: tool_reply("finish", {"success": True, "result": {"title": "C"}}))
     bad = "@step\nasync def extract(ctx):\n    return {'title': ''}"
     strong.on("patch", lambda m, t: json_reply({"mode": "functions", "functions": {"extract": bad}}))
@@ -170,7 +170,7 @@ async def test_patch_rejected_when_tests_fail(agent, fast, strong, web):
     await ev.drain()
     assert ev.history[-1]["status"] == "rejected"
     assert strong.calls.count("patch") == 2  # 带着测试失败信息重试过一次
-    assert agent.store.get("page_title").active_version == 1
+    assert agent.store.get("page-title").active_version == 1
     await ev.stop()
 
 

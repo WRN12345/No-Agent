@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from no_agent.engine.agent import EvolvingAgent, RunMode
 from no_agent.engine.evolver import Evolver
 from no_agent.llm import LLMs, build_llms
 from no_agent.skills.matcher import SkillMatcher
+from no_agent.skills.models import Skill
 from no_agent.storage.base import RunStore, SkillStore
 from no_agent.storage.files import FileSkillStore
 from no_agent.storage.home import init_home, resolve_home
@@ -123,6 +125,27 @@ class Agent:
     def add_tool(self, t: Tool) -> None:
         self.registry.register(t)
 
+    # ── 技能 ──
+
+    def skills(self, include_retired: bool = False) -> list[Skill]:
+        return self.store.list(include_retired=include_retired)
+
+    def skill(self, skill_id: str) -> "SkillHandle":
+        """
+        显式调用某个技能（跳过匹配，行为可预期）：
+            run = await agent.skill("fill-form").run({"url": "...", "data": {...}})
+        """
+        if self.store.get(skill_id) is None:
+            raise KeyError(f"技能不存在: {skill_id}")
+        return SkillHandle(self, skill_id)
+
+    def install_skill(self, path: str | Path, *, overwrite: bool = False) -> Skill:
+        """
+        从目录安装技能到本项目（复制）。可以是本框架产出的技能，也可以是普通的 Anthropic Skill（纯 SKILL.md）。
+        共享技能也可以不安装，直接用 AgentConfig(extra_skill_dirs=[...]) 以只读方式挂载。
+        """
+        return self.store.install(Path(path), overwrite=overwrite)
+
     # ── 生命周期 ──
 
     async def start(self) -> None:
@@ -175,5 +198,39 @@ class Agent:
                 return await self.run(task, **kwargs)
             finally:
                 await self.stop()
+
+        return asyncio.run(_main())
+
+
+class SkillHandle:
+    """agent.skill(id) 的返回值"""
+
+    def __init__(self, agent: Agent, skill_id: str) -> None:
+        self._agent = agent
+        self.id = skill_id
+
+    @property
+    def info(self) -> Skill:
+        skill = self._agent.store.get(self.id)
+        if skill is None:
+            raise KeyError(f"技能不存在: {self.id}")
+        return skill
+
+    async def run(self, params: dict[str, Any] | None = None, *, task: str | None = None) -> Run:
+        """
+        params 给定时直接执行（先按 params_schema 校验，不合法抛 ValueError）；
+        只给 task 时由小模型从 task 中抽取参数。
+        """
+        if params is None and task is None:
+            params = {}
+        text = task or f"执行技能 {self.id}：{json.dumps(params, ensure_ascii=False, default=str)}"
+        return await self._agent.run(text, mode="skill", skill_id=self.id, params=params)
+
+    def run_sync(self, params: dict[str, Any] | None = None, *, task: str | None = None) -> Run:
+        async def _main() -> Run:
+            try:
+                return await self.run(params, task=task)
+            finally:
+                await self._agent.stop()
 
         return asyncio.run(_main())

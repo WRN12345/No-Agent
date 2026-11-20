@@ -7,6 +7,7 @@ from sqlalchemy import inspect
 
 from no_agent import Agent, AgentConfig, FileSkillStore, Skill, SqlRunStore
 from no_agent.llm import LLMs
+from no_agent.skills import skillmd
 from no_agent.storage.home import HOME_DIRNAME, init_home, resolve_home
 from tests.conftest import tool_reply
 
@@ -44,7 +45,7 @@ def test_init_home_writes_gitignore(tmp_path):
 def test_layered_store_copy_on_write(tmp_path):
     shared = tmp_path / "shared"
     FileSkillStore(shared, stats_dir=tmp_path / "st0").create(make_skill("s1"), SCRIPT, reason="team")
-    shared_manifest = (shared / "s1" / "manifest.json").read_text(encoding="utf-8")
+    shared_manifest = (shared / "s1" / "no-agent.json").read_text(encoding="utf-8")
 
     local = tmp_path / "local"
     store = FileSkillStore(local, readonly_dirs=[shared], stats_dir=tmp_path / ".stats")
@@ -60,9 +61,9 @@ def test_layered_store_copy_on_write(tmp_path):
     # 修补 → 复制到本地，只读库不变
     store.add_version("s1", SCRIPT.replace("True", "False"), reason="patch", pass_rate=1.0)
     assert store.layer("s1") == "local"
-    assert (local / "s1" / "v1.py").exists() and (local / "s1" / "v2.py").exists()
-    assert (shared / "s1" / "manifest.json").read_text(encoding="utf-8") == shared_manifest
-    assert not (shared / "s1" / "v2.py").exists()
+    assert (local / "s1" / "scripts" / "flow_v1.py").exists() and (local / "s1" / "scripts" / "flow_v2.py").exists()
+    assert (shared / "s1" / "no-agent.json").read_text(encoding="utf-8") == shared_manifest
+    assert not (shared / "s1" / "scripts" / "flow_v2.py").exists()
 
     # 删除本地副本 → 只读版本重新露出来；只读技能本身不能删
     store.delete("s1")
@@ -71,18 +72,23 @@ def test_layered_store_copy_on_write(tmp_path):
         store.delete("s1")
 
 
-def test_manifest_has_schema_version_and_no_stats(tmp_path):
+def test_skill_dir_is_standard_skill_md(tmp_path):
     store = FileSkillStore(tmp_path / "skills")
-    store.create(make_skill(), SCRIPT, reason="r")
-    data = json.loads((tmp_path / "skills" / "s1" / "manifest.json").read_text(encoding="utf-8"))
-    assert data["schema_version"] == 1 and "stats" not in data
+    store.create(Skill(id="Page Title!", name="网页标题", description="获取网页标题", when_to_use="要标题时"), SCRIPT, reason="r")
+    d = tmp_path / "skills" / "page-title"  # id 规范化为 SKILL.md 的 name 格式
+    meta, body = skillmd.parse((d / "SKILL.md").read_text(encoding="utf-8"))
+    assert meta == {"name": "page-title", "description": "获取网页标题"}  # frontmatter 只有标准字段
+    assert "# 网页标题" in body and "## 何时使用" in body and "scripts/flow_v1.py" in body
+    ext = json.loads((d / "no-agent.json").read_text(encoding="utf-8"))
+    assert ext["schema_version"] == 2 and ext["name"] == "网页标题"
+    assert not {"stats", "guide", "description", "id", "tests"} & set(ext)
 
 
 def test_future_schema_skill_is_skipped(tmp_path):
     store = FileSkillStore(tmp_path / "skills")
     store.create(make_skill(), SCRIPT, reason="r")
-    p = tmp_path / "skills" / "s1" / "manifest.json"
-    p.write_text(p.read_text(encoding="utf-8").replace('"schema_version": 1', '"schema_version": 99'), encoding="utf-8")
+    p = tmp_path / "skills" / "s1" / "no-agent.json"
+    p.write_text(p.read_text(encoding="utf-8").replace('"schema_version": 2', '"schema_version": 99'), encoding="utf-8")
     assert FileSkillStore(tmp_path / "skills").get("s1") is None
 
 

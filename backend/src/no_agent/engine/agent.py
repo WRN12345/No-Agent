@@ -3,6 +3,8 @@
 
     （任何时候用户拒绝确认 / 取消输入 → mode=aborted，不计入统计，不触发进化）
 
+    （命中指南型技能（纯 SKILL.md）时：把指南交给 AI 照着做，mode=guide）
+
     任务 ─► 匹配技能 ──命中──► 执行脚本 ──成功──► 完成（最快、最省）
               │                   │
               │                   └─失败─► AI 从失败步骤接管 ──► 完成 ──► [异步] 修补脚本
@@ -24,6 +26,7 @@ from no_agent.llm import LLMs, metered
 from no_agent.storage.base import RunStore, SkillStore
 from no_agent.storage.sql import Run
 from no_agent.skills.matcher import MatchResult, SkillMatcher
+from no_agent.skills.models import Skill, validate_params
 from no_agent.skills.runtime import ExecutionResult, execute_script
 from no_agent.skills.script import function_source
 from no_agent.tools.base import Toolbox, ToolRegistry, UserAbort
@@ -75,12 +78,17 @@ class EvolvingAgent:
 
             if match:
                 trace["match"] = {
+                    "kind": match.skill.kind,
                     "skill_id": match.skill.id,
                     "version": match.skill.active_version,
                     "params": match.params,
                     "confidence": match.confidence,
                     "reason": match.reason,
                 }
+            if match and match.skill.kind == "guide":
+                # 指南型技能：没有脚本，把 SKILL.md 正文交给 AI 照着做
+                ff, abort = await self._freeform(task, toolbox, None, guide=match.skill)
+            elif match:
                 source = self.store.script(match.skill.id)
                 exe = await execute_script(
                     source, task=task, params=match.params, toolbox=toolbox, llm=self.llms.fast, step_timeout=self.s.step_timeout
@@ -115,7 +123,7 @@ class EvolvingAgent:
             run_mode, success, result, error = "skill", True, exe.result, None
         else:
             assert ff is not None
-            run_mode = "skill_takeover" if match else "freeform"
+            run_mode = ("guide" if match.skill.kind == "guide" else "skill_takeover") if match else "freeform"
             success, result = ff.success, ff.result
             error = ff.error or (None if ff.success else "未完成")
             trace["freeform"] = {"summary": ff.summary, "turns": ff.turns}
@@ -146,7 +154,7 @@ class EvolvingAgent:
             return run
         if match:
             self._record_skill(match, exe, success, latency)
-            if run_mode == "skill_takeover" and success:
+            if run_mode == "skill_takeover" and success:  # 只有流程型会走到接管
                 self.evolver.submit(Job("patch", run.id))
         elif success and toolbox.calls:
             # 没用工具的纯问答不值得提炼
@@ -161,13 +169,19 @@ class EvolvingAgent:
             if skill is None:
                 raise KeyError(f"技能不存在: {skill_id}")
             if params is not None:
+                if errors := validate_params(skill.params_schema, params):
+                    raise ValueError(f"技能 {skill.id} 参数不合法：" + "；".join(errors))
                 return MatchResult(skill=skill, params=params, confidence=1.0, reason="指定技能与参数")
+            if skill.kind == "guide" or not skill.params_schema.get("properties"):
+                return MatchResult(skill=skill, params={}, confidence=1.0, reason="指定技能（无需参数）")
             # 只指定技能：让小模型抽取参数
             m = await self.matcher.match(task, only=[skill])
             return m or MatchResult(skill=skill, params={}, confidence=0.0, reason="指定技能，未能抽取参数")
         return await self.matcher.match(task)
 
-    async def _freeform(self, task: str, toolbox: Toolbox, takeover: TakeoverContext | None) -> tuple[FreeformResult | None, str | None]:
+    async def _freeform(
+        self, task: str, toolbox: Toolbox, takeover: TakeoverContext | None, guide: Skill | None = None
+    ) -> tuple[FreeformResult | None, str | None]:
         try:
             ff = await run_freeform(
                 task,
@@ -176,6 +190,7 @@ class EvolvingAgent:
                 registry=self.registry,
                 max_turns=self.s.freeform_max_turns,
                 takeover=takeover,
+                guide=(guide.name, guide.guide) if guide else None,
             )
             return ff, None
         except UserAbort as e:
@@ -186,7 +201,8 @@ class EvolvingAgent:
         skill = self.store.get(match.skill.id)
         if skill is None:
             return
-        script_ok = bool(exe and exe.success)
+        # 指南型没有脚本，以最终是否成功计；流程型以脚本是否独立成功计（接管成功也算脚本失败）
+        script_ok = success if skill.kind == "guide" else bool(exe and exe.success)
         skill.stats.record(
             script_ok=script_ok,
             final_ok=success,

@@ -65,15 +65,17 @@ DISTILL_SYSTEM = f"""你是技能提炼者。下面是 AI 多次自由完成的�
 ## 提炼原则
 - 找出各轨迹中不变的流程（写成步骤）和变化的部分（变成参数）
 - 参数要能从用户的任务描述中抽取出来；用 JSON Schema 描述，写清楚每个参数的含义
+- guide 要写成独立可读的操作指南（会作为 SKILL.md 正文，其他 Agent 也会直接使用）
 - description / when_to_use 要写清楚能力边界，它们会被用来判断新任务是否适用这个技能
 - verify 要能识别出"结果看起来成功其实错误"的情况
 - 如果这些轨迹不属于同一类任务，只使用与轨迹 1 同类的轨迹（在 use 中列出编号）
 - 如果没有可复用的固定流程（一次性问题、纯闲聊、每次做法完全不同），输出 skip
 
 ## 输出（只输出 JSON）
-{{"skip": false, "use": [1, 2], "id": "snake_case_id", "name": "简短名称", "description": "这个技能做什么",
+{{"skip": false, "use": [1, 2], "id": "kebab-case-id（小写字母数字连字符）", "name": "简短名称", "description": "这个技能做什么（≤300字）",
  "when_to_use": "适用场景与边界", "keywords": ["..."], "params_schema": {{"type": "object", "properties": {{}}, "required": []}},
- "script": "完整脚本源码", "test_params": [与 use 中每条轨迹一一对应的参数对象]}}
+ "script": "完整脚本源码", "test_params": [与 use 中每条轨迹一一对应的参数对象],
+ "guide": "Markdown 操作指南：给人或其他 Agent 看，不依赖本框架也能照着完成（步骤 + 注意事项 + 常见坑）"}}
 或：{{"skip": true, "reason": "..."}}"""
 
 
@@ -300,6 +302,7 @@ class Evolver:
                     when_to_use=str(out.get("when_to_use", "")),
                     keywords=[str(k) for k in out.get("keywords", [])],
                     params_schema=out.get("params_schema") or {"type": "object", "properties": {}},
+                    guide=str(out.get("guide") or ""),
                 )
             except (ScriptError, KeyError, ValueError, TypeError) as e:
                 extra = f"\n\n## 上一次输出不合法\n{e}\n请修正后重新输出。"

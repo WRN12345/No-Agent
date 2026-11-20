@@ -15,6 +15,8 @@ from typing import Any
 from no_agent.llm import BaseLLM
 from no_agent.tools.base import Toolbox, ToolError, ToolRegistry, truncate
 
+GUIDE_LIMIT = 8000  # 注入提示词的指南最大长度
+
 FINISH_TOOL = {
     "type": "function",
     "function": {
@@ -113,11 +115,20 @@ async def run_freeform(
     registry: ToolRegistry,
     max_turns: int = 20,
     takeover: TakeoverContext | None = None,
+    guide: tuple[str, str] | None = None,
 ) -> FreeformResult:
     system = FREEFORM_SYSTEM + (takeover.render() if takeover else "")
+    if guide:
+        name, body = guide
+        system += (
+            f"\n\n## 参考技能：{name}\n"
+            "以下是完成这类任务的经验指南，请按照它来做（与实际页面/数据不符时以实际为准）：\n\n"
+            f"{body[:GUIDE_LIMIT]}"
+        )
+
     messages: list[dict[str, Any]] = [{"role": "system", "content": system}, {"role": "user", "content": task}]
     tools = registry.specs() + [FINISH_TOOL]
-    purpose = "takeover" if takeover else "freeform"
+    purpose = "takeover" if takeover else ("guide" if guide else "freeform")
     step_label = "takeover" if takeover else None
 
     for turn in range(1, max_turns + 1):

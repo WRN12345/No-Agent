@@ -13,6 +13,7 @@ from no_agent.server.schemas import (
     RunDetail,
     RunRequest,
     RunResponse,
+    SkillRunRequest,
     SkillSummary,
     VersionRequest,
 )
@@ -30,6 +31,7 @@ def create_router(agent: Agent | Callable[[], Agent]) -> APIRouter:
             name=s.name,
             description=s.description,
             status=s.status,
+            kind=s.kind,
             layer=a.store.layer(s.id),
             active_version=s.active_version,
             versions=len(s.versions),
@@ -56,6 +58,8 @@ def create_router(agent: Agent | Callable[[], Agent]) -> APIRouter:
             run = await a.run(req.task, mode=req.mode, skill_id=req.skill_id, params=req.params)
         except KeyError as e:
             raise HTTPException(404, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
         return RunResponse.of(run)
 
     @router.get("/runs", response_model=list[RunResponse], tags=["run"])
@@ -104,12 +108,24 @@ def create_router(agent: Agent | Callable[[], Agent]) -> APIRouter:
         s = _skill(a, skill_id)
         data = s.model_dump(mode="json", exclude={"tests"})
         data["layer"] = a.store.layer(skill_id)
+        data["kind"] = s.kind
         data["tests"] = [{"id": t.id, "task": t.task, "params": t.params} for t in s.tests]
-        try:
-            data["script"] = a.store.script(skill_id, version)
-        except KeyError as e:
-            raise HTTPException(404, str(e)) from e
+        if s.kind == "flow" or version:
+            try:
+                data["script"] = a.store.script(skill_id, version)
+            except KeyError as e:
+                raise HTTPException(404, str(e)) from e
         return data
+
+    @router.post("/skills/{skill_id}/run", response_model=RunResponse, tags=["skills"])
+    async def run_skill(skill_id: str, req: SkillRunRequest, a: Agent = Depends(get_agent)) -> RunResponse:
+        """显式调用技能：跳过匹配，参数按 params_schema 校验"""
+        _skill(a, skill_id)
+        try:
+            run = await a.skill(skill_id).run(req.params, task=req.task)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        return RunResponse.of(run)
 
     @router.post("/skills/{skill_id}/activate", tags=["skills"])
     async def activate_version(skill_id: str, req: VersionRequest, a: Agent = Depends(get_agent)) -> SkillSummary:
