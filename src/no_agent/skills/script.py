@@ -64,6 +64,8 @@ SCRIPT_API_DOC = '''
 - `await ctx.llm(instruction, input=None, json=False)` 调用小模型做"需要理解"的事（抽取、分类、总结）。json=True 时返回 dict
 - `await ctx.ask(questions, title="")` 向用户提问，questions 为 [{key, label, kind: text|choice|confirm, options, required}]，一次问完所有缺失信息，返回 {key: 回答}
 - `await ctx.confirm(message)` 向用户确认一件事，返回 bool
+- `await ctx.skill(skill_id, **params)` 调用另一个已有的流程型技能，返回它的结果（它在自己的权限下运行，失败时本步骤失败）。
+  已有技能能做的事不要重写，直接调用
 - `ctx.log(msg)` 记录日志
 - `ctx.fail(reason)` 主动判定失败（例如数据不符合预期），会触发 AI 接管
 
@@ -209,6 +211,31 @@ def load_script(source: str) -> LoadedScript:
     loaded.verify = verify if callable(verify) else None
     loaded.guard = guard if callable(guard) else None
     return loaded
+
+
+def script_skills(source: str) -> set[str]:
+    """静态找出脚本中 ctx.skill("id", ...) 调用的子技能"""
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "skill"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            names.add(node.args[0].value)
+    return names
+
+
+def count_llm_calls(source: str) -> int:
+    """脚本里 ctx.llm(...) 的调用点数量（多候选排序时越少越好：更确定、更省）"""
+    return sum(
+        1
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "llm"
+    )
 
 
 def script_tools(source: str) -> set[str]:

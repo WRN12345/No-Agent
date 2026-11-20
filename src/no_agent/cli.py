@@ -5,6 +5,8 @@
     no-agent serve [--port N]   启动 HTTP 服务
     no-agent skills             列出技能
     no-agent install <目录>     安装技能（SKILL.md 目录）
+    no-agent sync               拉取 / 更新 git 技能仓库
+    no-agent keygen / sign      生成签名密钥 / 给技能签名
 
 在 MCP 客户端中配置，例如：
     {"mcpServers": {"no-agent": {"command": "no-agent", "args": ["mcp"], "env": {"NO_AGENT_HOME": "/path/to/project/.no-agent"}}}}
@@ -35,6 +37,13 @@ def main(argv: list[str] | None = None) -> int:
     p_install = sub.add_parser("install", help="安装技能目录")
     p_install.add_argument("path")
     p_install.add_argument("--overwrite", action="store_true")
+    sub.add_parser("sync", help="拉取 / 更新配置的 git 技能仓库")
+    p_keygen = sub.add_parser("keygen", help="生成签名密钥")
+    p_keygen.add_argument("--out", required=True, help="私钥保存路径（妥善保管，不要提交到 git）")
+    p_sign = sub.add_parser("sign", help="给技能目录签名")
+    p_sign.add_argument("path")
+    p_sign.add_argument("--key", required=True, help="私钥文件")
+    p_sign.add_argument("--signer", required=True, help="签名者名称（与 trusted_signers 中的键一致）")
     args = parser.parse_args(argv)
 
     # stdio MCP 用 stdout 传协议数据，日志必须写到 stderr
@@ -58,6 +67,24 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "install":
         s = _agent().install_skill(args.path, overwrite=args.overwrite)
         print(f"已安装 {s.id}（{s.kind}）")
+    elif args.cmd == "sync":
+        for r in asyncio.run(_agent().sync_skill_repos()):
+            print(f"{r['url']}: {r.get('commit') or '失败 ' + r.get('error', '')}")
+    elif args.cmd == "keygen":
+        from pathlib import Path
+
+        from no_agent.skills.signing import generate_keypair
+
+        pem, pub = generate_keypair()
+        Path(args.out).write_bytes(pem)
+        print(f"私钥已保存到 {args.out}\n公钥（填入 trusted_signers）: {pub}")
+    elif args.cmd == "sign":
+        from pathlib import Path
+
+        from no_agent.skills.signing import sign_skill
+
+        sig = sign_skill(Path(args.path), Path(args.key).read_bytes(), args.signer)
+        print(f"已签名 {sig['skill']}：{len(sig['files'])} 个文件")
     return 0
 
 

@@ -2,13 +2,13 @@
 services:
   no-agent:
     build:
-      context: ./backend
-      dockerfile: Dockerfile.backend
+      context: .
+      dockerfile: Dockerfile
     container_name: no-agent
     ports:
       - "8000:8000"
     env_file:
-      - backend/.env
+      - .env
     volumes:
       - no-agent-data:/data  # 技能库与运行记录需要持久化
 

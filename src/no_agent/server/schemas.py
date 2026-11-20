@@ -67,6 +67,8 @@ class SkillSummary(BaseModel):
     description: str
     status: str
     kind: str  # flow：带流程脚本 | guide：纯 SKILL.md 指南
+    role: str = "task"  # task：可匹配整任务 | atomic：原子技能，供其他脚本调用
+    trust: str | None = None  # 共享技能的信任说明（已签名 / 未签名 / 被修改）
     layer: str  # local：本项目技能库 | shared：只读共享库
     active_version: int
     shadow_version: int | None = None  # 影子运行中的候选版本

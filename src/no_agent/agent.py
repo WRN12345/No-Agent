@@ -70,10 +70,13 @@ class Agent:
         # ── 存储：只有用到默认实现时才创建 home 目录 ──
         # 技能层（优先级从低到高）：框架内置 → extra_skill_dirs → 本地可写层
         builtin_layers = [BUILTIN_SKILLS_DIR] if cfg.browser.enabled else []
+        repo_layers = [d for d in self._repo_dirs() if d.is_dir()]  # 只加载已同步到本地的仓库（启动时不联网）
         self.store: SkillStore = skill_store or FileSkillStore(
             cfg.skills_dir or self.home / "skills",
-            readonly_dirs=[*builtin_layers, *cfg.extra_skill_dirs],
+            readonly_dirs=[*builtin_layers, *repo_layers, *cfg.extra_skill_dirs],
             stats_dir=self.home / ".stats",
+            trusted_dirs=builtin_layers,
+            verifier=None if cfg.untrusted_shared == "allow" else self._verify_shared,
         )
         self.runs: RunStore = run_store or SqlRunStore(cfg.database_url or f"sqlite:///{(self.home / 'runs.db').as_posix()}")
 
@@ -130,6 +133,55 @@ class Agent:
 
     def add_tool(self, t: Tool) -> None:
         self.registry.register(t)
+
+    # ── 共享技能：签名与 git 仓库 ──
+
+    def _verify_shared(self, skill_dir: Path) -> tuple[bool, str]:
+        from no_agent.skills.signing import verify_skill
+
+        return verify_skill(skill_dir, self.config.trusted_signers)
+
+    def _repo_dirs(self) -> list[Path]:
+        return [self._repo_root(r) / r.subdir if r.subdir else self._repo_root(r) for r in self.config.skill_repos]
+
+    def _repo_root(self, repo: Any) -> Path:
+        from no_agent.storage.files import slugify
+
+        name = repo.name or slugify(repo.url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git"))
+        return self.home / "repos" / name
+
+    async def sync_skill_repos(self) -> list[dict[str, Any]]:
+        """拉取 / 更新配置的 git 技能仓库，然后重新加载技能（仓库副本只读，本地修改会被覆盖）"""
+        import subprocess
+
+        def git(*args: str, cwd: Path | None = None) -> str:
+            res = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8")
+            if res.returncode != 0:
+                raise RuntimeError(f"git {' '.join(args)} 失败: {res.stderr.strip()}")
+            return res.stdout.strip()
+
+        def sync_one(repo: Any) -> dict[str, Any]:
+            root = self._repo_root(repo)
+            if not (root / ".git").exists():
+                root.parent.mkdir(parents=True, exist_ok=True)
+                git("clone", "--depth", "1", *(["--branch", repo.ref] if repo.ref else []), repo.url, str(root))
+            else:
+                git("fetch", "--depth", "1", "origin", repo.ref or "HEAD", cwd=root)
+                git("reset", "--hard", "FETCH_HEAD", cwd=root)
+            return {"url": repo.url, "dir": str(root), "commit": git("rev-parse", "--short", "HEAD", cwd=root)}
+
+        results = []
+        for repo in self.config.skill_repos:
+            try:
+                results.append(await asyncio.to_thread(sync_one, repo))
+            except Exception as e:  # noqa: BLE001
+                results.append({"url": repo.url, "error": str(e)})
+        if isinstance(self.store, FileSkillStore):
+            dirs = self._repo_dirs()
+            builtin = [d for d in self.store.readonly_dirs if d == BUILTIN_SKILLS_DIR]
+            self.store.readonly_dirs = [*builtin, *[d for d in dirs if d.is_dir()], *self.config.extra_skill_dirs]
+        self.store.reload()
+        return results
 
     # ── 技能 ──
 

@@ -25,6 +25,7 @@ from no_agent.engine.freeform import FreeformResult, TakeoverContext, run_freefo
 from no_agent.llm import LLMs, metered
 from no_agent.storage.base import RunStore, SkillStore
 from no_agent.storage.sql import Run
+from no_agent.skills.compose import SkillCaller
 from no_agent.skills.matcher import MatchResult, SkillMatcher
 from no_agent.skills.models import Skill, validate_params
 from no_agent.skills.runtime import ExecutionResult, execute_script
@@ -94,7 +95,10 @@ class EvolvingAgent:
                 toolbox.restrict(perms.tools, perms.domains)  # 脚本只能用声明过的工具 / 域名
                 try:
                     exe = await execute_script(
-                        source, task=task, params=match.params, toolbox=toolbox, llm=self.llms.fast, step_timeout=self.s.step_timeout
+                        source, task=task, params=match.params, toolbox=toolbox, llm=self.llms.fast,
+                        step_timeout=self.s.step_timeout,
+                        skills=SkillCaller(self.store, self.llms.fast, step_timeout=self.s.step_timeout, stack=(match.skill.id,)),
+                        skill_allowlist=perms.skills,
                     )
                 finally:
                     toolbox.restrict(None, None)  # AI 接管不受技能权限限制
@@ -165,6 +169,8 @@ class EvolvingAgent:
             self._record_skill(match, exe, success, latency)
             if run_mode == "skill_takeover" and success:  # 只有流程型会走到接管
                 self.evolver.submit(Job("patch", run.id))
+            elif run_mode == "guide" and success and toolbox.calls:  # 指南型用得多了 → 升级成脚本
+                self.evolver.submit(Job("upgrade", run.id, skill_id=match.skill.id))
         elif success and toolbox.calls:
             # 没用工具的纯问答不值得提炼
             self.evolver.submit(Job("distill", run.id))
@@ -174,7 +180,7 @@ class EvolvingAgent:
         """真实运行成功后，让候选版本 / 影子技能在后台用这次的录制数据跑一遍，用于比对转正"""
         if not run.success:
             return
-        if match and match.skill.kind == "flow":
+        if match:
             skill = self.store.get(match.skill.id)
             if skill and skill.shadow:
                 self.evolver.submit(Job("shadow", run.id, skill_id=skill.id, version=skill.shadow.version))

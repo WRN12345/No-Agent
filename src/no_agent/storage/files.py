@@ -25,7 +25,7 @@ import shutil
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from no_agent.skills import skillmd
 from no_agent.skills.models import ShadowState, Skill, SkillStats, TestCase, VersionInfo
@@ -102,9 +102,27 @@ def _legacy_skill(d: Path) -> Skill:
 
 
 class FileSkillStore:
-    def __init__(self, root: Path, *, readonly_dirs: list[Path] | None = None, stats_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        readonly_dirs: list[Path] | None = None,
+        stats_dir: Path | None = None,
+        trusted_dirs: list[Path] | None = None,
+        verifier: Callable[[Path], tuple[bool, str]] | None = None,
+    ) -> None:
+        """
+        trusted_dirs：无需验证签名的只读层（如框架内置技能）
+        verifier：只读层技能的信任检查（返回 (是否可信, 说明)）。不可信的技能：
+          流程型 → 先进入影子运行，在本地任务上比对通过后才转正（转正时复制到可写层）
+          指南型 → 不自动使用（正文会进入 AI 提示词），需要 install 显式信任
+        verifier 为 None 时只读层全部视为可信
+        """
         self.root = Path(root)
         self.readonly_dirs = [Path(d) for d in (readonly_dirs or [])]
+        self.trusted_dirs = {Path(d).resolve() for d in (trusted_dirs or [])}
+        self.verifier = verifier
+        self.trust: dict[str, str] = {}  # 只读层技能的信任说明
         self.stats_dir = Path(stats_dir) if stats_dir else self.root.parent / ".stats"
         self.root.mkdir(parents=True, exist_ok=True)
         self.stats_dir.mkdir(parents=True, exist_ok=True)
@@ -139,6 +157,12 @@ class FileSkillStore:
                         else:
                             self._legacy.add(skill.id)
                     skill.stats = self._load_stats(skill.id)
+                    self.trust.pop(skill.id, None)
+                    if layer != self.root and self.verifier and layer.resolve() not in self.trusted_dirs:
+                        ok, note = self.verifier(d)
+                        self.trust[skill.id] = note
+                        if not ok and skill.status == "active":
+                            self._quarantine(skill, note)
                     self._cache[skill.id] = skill
                     self._origin[skill.id] = d
 
@@ -162,6 +186,14 @@ class FileSkillStore:
         self._write_skill(d, skill)
         (d / LEGACY_MANIFEST).unlink()
         return d
+
+    @staticmethod
+    def _quarantine(skill: Skill, note: str) -> None:
+        """不可信的共享技能：仅在内存中改为影子状态（共享库本身不会被修改）"""
+        logger.info("共享技能 %s 不可信（%s），先进入影子运行", skill.id, note)
+        skill.status = "shadow"
+        if skill.kind == "flow" and skill.shadow is None:
+            skill.shadow = ShadowState(version=skill.active_version)
 
     def _load_stats(self, skill_id: str) -> SkillStats:
         p = self.stats_dir / f"{skill_id}.json"
@@ -276,6 +308,15 @@ class FileSkillStore:
         self.save(skill)
 
     def _activate(self, skill: Skill, version: int) -> None:
+        old = skill.active_version
+        self.trust.pop(skill.id, None)  # 转正后成为本地技能
+        if old and old != version and skill.guide:  # 正文里引用的脚本路径跟着更新
+            skill.guide = skill.guide.replace(script_relpath(old), script_relpath(version))
+        elif not old and skill.guide and script_relpath(version) not in skill.guide:  # 指南型升级为流程型
+            skill.guide = skill.guide.rstrip() + (
+                f"\n\n## 自动执行\n\n本技能已由 No-Agent 从实际使用中提炼出流程脚本 `{script_relpath(version)}`，"
+                "可直接执行；失败时由 AI 接管并自动修补。\n"
+            )
         for x in skill.versions:
             if x.status == "active" and x.version != version:
                 x.status = "superseded"

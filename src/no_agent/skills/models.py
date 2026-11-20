@@ -114,6 +114,7 @@ class Permissions(BaseModel):
 
     tools: list[str] = []  # 用到的工具；空表示未声明
     domains: list[str] = []  # 会访问的域名
+    skills: list[str] = []  # 会通过 ctx.skill() 调用的其他技能（声明了 tools 时必须声明）
 
 
 class Skill(BaseModel):
@@ -136,6 +137,8 @@ class Skill(BaseModel):
     permissions: Permissions = Field(default_factory=Permissions)
     # active：正常使用 | shadow：新提炼的技能，影子运行中，尚未对外生效 | retired：已下线
     status: Literal["active", "shadow", "retired"] = "active"
+    # task：可被整任务匹配 | atomic：原子技能，不直接匹配任务，作为积木被其他脚本 ctx.skill() 调用
+    role: Literal["task", "atomic"] = "task"
     active_version: int = 0  # 0 = 没有流程脚本（指南型）
     versions: list[VersionInfo] = []
     shadow: ShadowState | None = None  # 有候选版本在影子运行时非空

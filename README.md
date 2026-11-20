@@ -22,7 +22,14 @@ pip install "No-Agent[mcp]"       # MCP 服务端 / 客户端
 pip install "No-Agent[browser-use]"  # browser-use 浏览器 Agent（开放式网页探索）
 ```
 
-本仓库开发：`cd backend && pip install -e ".[dev]" && python -m pytest`（离线跑通完整进化闭环，使用假 LLM）。
+发布到 PyPI 之前，直接从 GitHub 安装：
+
+```bash
+pip install "git+https://github.com/WRN12345/No-Agent.git"
+pip install "No-Agent[browser,mcp] @ git+https://github.com/WRN12345/No-Agent.git"   # 带可选依赖
+```
+
+本仓库开发：`pip install -e ".[dev]" && python -m pytest`（离线跑通完整进化闭环，使用假 LLM）。
 
 ## 作为库使用
 
@@ -89,6 +96,60 @@ AgentConfig(extra_skill_dirs=["/team/skills"])     # 或以只读方式挂载团
 - 写回 SKILL.md 时只更新 `name` / `description`，**保留其他 frontmatter 字段和正文**
 - 提炼新技能时，强模型会同时写出正文指南，所以学到的技能脱离本框架也能被其他 Agent 使用
 - 旧格式（`manifest.json` + `vN.py`）加载时自动迁移
+
+### 技能组合与原子技能
+
+脚本里可以调用别的流程型技能，像调用函数一样：
+
+```python
+@step
+async def report(ctx):
+    page = await ctx.skill("fetch-html", url=ctx.params["url"])   # 在 fetch-html 自己的权限下运行
+    ...
+```
+
+- **原子技能**（`role="atomic"`）：小粒度、可复用的积木（如登录、取网页、查订单），不直接匹配整个任务，只被其他脚本调用
+- 子技能失败 → 调用它的步骤失败（父脚本整体由 AI 接管、修补）；嵌套最多 3 层，循环调用会被拦截
+- 声明了权限的技能，调用子技能也要在 `permissions.skills` 中声明
+- 提炼新技能时，强模型能看到已有的可复用技能（优先调用而不是重写），也可以顺手抽出新的原子技能
+
+### 技能怎么"长"出来
+
+```
+AI 自由执行 ─(同类任务成功 N 次)─► 提炼 ─┐
+                                        ├─► 多个候选脚本 → 回放测试 → 选最好的 → 影子运行 → 转正
+指南型技能 ─(被成功使用 N 次 = 热度)─► 升级 ─┘                                          （流程型）
+流程型 ─(失败 → AI 接管)─► 只修补出错的步骤 → 回放测试 → 影子运行 → 转正
+```
+
+- **多候选提炼**：一次生成 `distill_candidates` 个（默认 2）思路不同的候选，按"测试通过率 → `ctx.llm` 调用点越少越好（更确定、更省） → 代码越短越好"选出最好的
+- **按热度升级**：指南型技能（例如装进来的第三方 SKILL.md）被成功使用够多次后，从这些执行轨迹提炼出流程脚本，作为候选挂到同一个技能上；转正前仍按指南执行，转正后直接跑脚本。原指南保留，自动追加"自动执行"说明
+
+## 共享技能：git 仓库与签名
+
+```python
+AgentConfig(
+    skill_repos=[SkillRepoConfig(url="https://github.com/your-team/skills.git", subdir="skills")],
+    trusted_signers={"team": "<公钥>"},
+)
+await agent.sync_skill_repos()      # 或命令行 no-agent sync；启动时不联网，只加载已同步的副本
+```
+
+```bash
+no-agent keygen --out team.key                         # 生成密钥（私钥妥善保管），打印公钥
+no-agent sign skills/fill-form --key team.key --signer team
+```
+
+共享层（`skill_repos` / `extra_skill_dirs`）里的技能按签名决定信任（需要 `pip install "No-Agent[sign]"`）：
+
+| 情况 | 处理 |
+|---|---|
+| 框架内置 / 本项目自己的技能 | 直接使用 |
+| 由 `trusted_signers` 中的签名者签名，且签名后未被修改 | 直接使用 |
+| 未签名 / 签名者不可信 / 签名后被改过 — 流程型 | **先影子运行**：不对外生效，在你自己的任务上与真实结果比对，通过后转正（复制到本地） |
+| 同上 — 指南型 | 不自动使用（正文会进入 AI 的提示词，有注入风险）；需要 `install` 显式信任 |
+
+签名覆盖技能目录下每个文件的 SHA-256，任何改动都会让签名失效。`untrusted_shared="allow"` 可关闭这套检查。
 
 ## 浏览器与人机交互
 
@@ -170,6 +231,8 @@ no-agent mcp                 # 启动 MCP 服务（stdio）
 no-agent serve --port 8000   # 启动 HTTP 服务
 no-agent skills              # 列出技能（含候选版本、成功率）
 no-agent install <目录>      # 安装技能
+no-agent sync                # 拉取 / 更新 git 技能仓库
+no-agent keygen / sign       # 生成签名密钥 / 给技能签名
 ```
 
 ## 数据存在哪
@@ -219,7 +282,7 @@ app.include_router(create_router(agent), prefix="/agent")
 ```bash
 # 独立运行（从 NO_AGENT_* 环境变量读配置）
 uvicorn no_agent.server:app
-docker compose up                  # 见 ../docker-compose.yml，数据在 /data 卷中
+docker compose up                  # 见 docker-compose.yml，数据在 /data 卷中
 ```
 
 | 方法 | 路径 | 说明 |
@@ -243,9 +306,11 @@ docker compose up                  # 见 ../docker-compose.yml，数据在 /data
 | `src/no_agent/config.py` | `AgentConfig` / `LLMConfig` |
 | `src/no_agent/engine/agent.py` | 主流程：匹配 → 执行 → 接管 → 记录 → 投递进化任务 |
 | `src/no_agent/engine/freeform.py` | 自由执行 / 接管（工具调用循环） |
-| `src/no_agent/engine/evolver.py` | 后台进化器：提炼（distill）、修补（patch）、反馈修补（feedback） |
+| `src/no_agent/engine/evolver.py` | 后台进化器：提炼（distill，多候选 + 原子技能）、升级（upgrade，指南 → 脚本）、修补（patch / feedback）、影子运行（shadow） |
 | `src/no_agent/engine/testing.py` | 上线门禁：录制回放测试 |
 | `src/no_agent/skills/skillmd.py` | SKILL.md 解析、校验、渲染 |
+| `src/no_agent/skills/compose.py` | 技能组合：`ctx.skill()` 调用子技能 |
+| `src/no_agent/skills/signing.py` | 技能签名与验证（Ed25519） |
 | `src/no_agent/skills/script.py` | 脚本格式、AST 安全校验、按函数修补、`SCRIPT_API_DOC` |
 | `src/no_agent/skills/runtime.py` | 逐步执行器，精确报告失败步骤、错误行号、当时状态 |
 | `src/no_agent/skills/matcher.py` | 本地召回（向量 / 词法）+ 小模型判定与参数抽取 |
@@ -270,6 +335,8 @@ docker compose up                  # 见 ../docker-compose.yml，数据在 /data
 - **录制回放**：测试时参数一致的工具调用直接回放录制结果，有副作用的调用不执行（dry run）。工具务必正确标注 `side_effect`。
 - **模型分层**：高频的匹配用 fast 模型，低频的提炼/修补用 strong 模型；技能库为空或无召回候选时不调用匹配模型。
 - **混合脚本**：确定的部分写成代码，需要理解的部分用 `ctx.llm()` 调小模型。
+- **技能组合**：`ctx.skill()` 调用子技能，子技能在自己的权限下运行；原子技能是不参与整任务匹配的积木
+- **共享即代码**：共享技能按签名决定信任，未签名的流程型技能先影子运行，未签名的指南型技能不自动使用
 - **自动下线**：当前版本最近 `retire_window` 次中脚本独立成功率低于阈值 → `retired`；可回滚 / 重新启用。
 
 ## 已知限制 / 后续方向
@@ -277,7 +344,8 @@ docker compose up                  # 见 ../docker-compose.yml，数据在 /data
 - **沙箱不是强隔离**：AST 白名单 + 受限 builtins 能挡住常见误用，但不是安全边界。工具能触及敏感系统时，应把脚本执行放到独立进程 / 容器。
 - **单进程**：进化器是进程内 asyncio 队列，文件技能库用进程内锁。多进程 / 多实例部署需要外部队列和带锁的存储（可通过自定义 `SkillStore` 实现）。
 - **命名空间（多租户）**：尚未支持，计划后续加入，届时通过 `schema_version` 迁移已有数据。
-- **共享技能的上游更新**：技能一旦复制到本地，本地版本优先，不会自动合并上游更新。
+- **共享技能的上游更新**：技能一旦复制到本地（被修补 / 转正），本地版本优先，不会自动合并上游更新。
+- **原子技能**：随父技能一起提炼时直接上线（只能被调用，不参与匹配）；父技能在影子期被淘汰时，原子技能会保留。
 - **浏览器**：每个 Agent 共用一个浏览器上下文，暂不支持文件上传、验证码；`run_sync` 每次调用结束都会关闭浏览器。
 - **browser_agent 的轨迹是黑盒**：browser-use 内部的每一步不会录进轨迹，所以经过它的部分无法被提炼成确定性脚本（只能提炼它前后的确定性步骤）。
 - **MCP 服务**：目前只提供 stdio 传输；HTTP 传输（Streamable HTTP）待做。技能列表变化时不会主动通知客户端，客户端重新列出工具即可看到。
@@ -289,4 +357,4 @@ docker compose up                  # 见 ../docker-compose.yml，数据在 /data
 | 1 | SKILL.md 格式适配、指南型技能、安装、显式调用 | ✅ 完成 |
 | 2 | 前置检查（guard）、影子运行后自动转正、权限强制检查 | ✅ 完成 |
 | 3 | MCP 服务端 / 客户端、接入 browser-use 作为 AI 浏览层、命令行 | ✅ 完成 |
-| 4 | L1 原子技能层、按热度升级（指南 → 脚本）、多候选提炼、git 技能仓库 + 签名 | 待做 |
+| 4 | 原子技能与技能组合、按热度升级（指南 → 脚本）、多候选提炼、git 技能仓库 + 签名 | ✅ 完成 |

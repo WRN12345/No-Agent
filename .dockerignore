@@ -1,8 +1,11 @@
-frontend/vue-project/node_modules
-frontend/vue-project/dist
-frontend/vue-project/.vscode
 .git
 .gitignore
 .vscode
-__pycache__
+.env
+.no-agent/
+.pytest_tmp/
+.pytest_cache/
+tests/
+examples/
+**/__pycache__
 *.pyc

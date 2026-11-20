@@ -45,6 +45,7 @@ async def run_tests(
     step_timeout: float = 60.0,
     concurrency: int = 4,
     permissions: Permissions | None = None,
+    skills: Any = None,
 ) -> TestReport:
     sem = asyncio.Semaphore(concurrency)
 
@@ -54,7 +55,8 @@ async def run_tests(
             if permissions is not None:
                 toolbox.restrict(permissions.tools, permissions.domains)
             return case, await execute_script(
-                source, task=case.task, params=case.params, toolbox=toolbox, llm=llm, step_timeout=step_timeout
+                source, task=case.task, params=case.params, toolbox=toolbox, llm=llm, step_timeout=step_timeout,
+                skills=skills, skill_allowlist=permissions.skills if permissions else None,
             )
 
     report = TestReport(total=len(cases))

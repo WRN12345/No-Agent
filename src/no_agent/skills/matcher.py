@@ -98,7 +98,8 @@ class SkillMatcher:
         return lexical_similarity(a, b)
 
     async def candidates(self, task: str, skills: list[Skill] | None = None) -> list[tuple[Skill, float]]:
-        skills = skills if skills is not None else self.store.list()
+        # 默认只匹配可以完成整个任务的技能（原子技能只作为积木被调用）
+        skills = skills if skills is not None else [s for s in self.store.list() if s.role == "task"]
         if not skills:
             return []
         scored: list[tuple[Skill, float]] | None = None

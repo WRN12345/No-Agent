@@ -26,8 +26,19 @@ from no_agent.storage.base import RunStore, SkillStore
 from no_agent.storage.sql import Run
 from no_agent.skills.matcher import SkillMatcher, lexical_similarity
 from no_agent.skills.models import Permissions, ShadowRecord, Skill, TestCase
+from no_agent.skills.compose import SkillCaller
 from no_agent.skills.runtime import execute_script
-from no_agent.skills.script import SCRIPT_API_DOC, ScriptError, numbered, replace_functions, script_tools, validate_script
+from no_agent.skills.script import (
+    SCRIPT_API_DOC,
+    ScriptError,
+    count_llm_calls,
+    numbered,
+    replace_functions,
+    script_skills,
+    script_tools,
+    validate_script,
+)
+from no_agent.storage.files import slugify
 from no_agent.tools.base import ALWAYS_ALLOWED, ReplayToolbox, ToolRegistry, host_of, truncate
 
 logger = logging.getLogger(__name__)
@@ -37,7 +48,7 @@ SKIPPED_MARK = "__skipped__"  # 提炼器判定不值得做成技能的轨迹
 
 @dataclass
 class Job:
-    kind: Literal["patch", "feedback", "distill", "shadow", "shadow_match"]
+    kind: Literal["patch", "feedback", "distill", "upgrade", "shadow", "shadow_match"]
     run_id: str
     skill_id: str | None = None
     version: int | None = None
@@ -61,24 +72,28 @@ PATCH_SYSTEM = f"""你是技能脚本的维护者。一个自动化技能脚本�
 无需修改：{{"give_up": true, "reason": "..."}}"""
 
 
-DISTILL_SYSTEM = f"""你是技能提炼者。下面是 AI 多次自由完成的同类任务的执行轨迹。你要把它们泛化为一个可复用、参数化的技能脚本，让以后同类任务直接由脚本完成，不再需要大模型逐步推理。
+DISTILL_SYSTEM = f"""你是技能提炼者。下面是 AI 多次完成的同类任务的执行轨迹。你要把它们泛化为一个可复用、参数化的技能脚本，让以后同类任务直接由脚本完成，不再需要大模型逐步推理。
 
 {SCRIPT_API_DOC}
 
 ## 提炼原则
 - 找出各轨迹中不变的流程（写成步骤）和变化的部分（变成参数）
 - 参数要能从用户的任务描述中抽取出来；用 JSON Schema 描述，写清楚每个参数的含义
+- 已有技能（见"可复用的已有技能"）能完成的部分，用 ctx.skill 调用，不要重写
+- 可以把通用的子步骤抽成原子技能（atoms），主脚本用 ctx.skill 调用；只抽真正可能在别的任务里复用的部分
+- 给出 1~{{n}} 个思路不同的候选脚本（例如一个尽量用确定性代码、一个对页面/数据变化更稳健），系统会回放测试并选出最好的
 - guide 要写成独立可读的操作指南（会作为 SKILL.md 正文，其他 Agent 也会直接使用）
 - description / when_to_use 要写清楚能力边界，它们会被用来判断新任务是否适用这个技能
-- verify 要能识别出"结果看起来成功其实错误"的情况
+- verify 要能识别出"结果看起来成功其实错误"的情况；有不可撤销步骤时写 guard
 - 如果这些轨迹不属于同一类任务，只使用与轨迹 1 同类的轨迹（在 use 中列出编号）
 - 如果没有可复用的固定流程（一次性问题、纯闲聊、每次做法完全不同），输出 skip
 
 ## 输出（只输出 JSON）
 {{"skip": false, "use": [1, 2], "id": "kebab-case-id（小写字母数字连字符）", "name": "简短名称", "description": "这个技能做什么（≤300字）",
  "when_to_use": "适用场景与边界", "keywords": ["..."], "params_schema": {{"type": "object", "properties": {{}}, "required": []}},
- "script": "完整脚本源码", "test_params": [与 use 中每条轨迹一一对应的参数对象],
- "guide": "Markdown 操作指南：给人或其他 Agent 看，不依赖本框架也能照着完成（步骤 + 注意事项 + 常见坑）"}}
+ "scripts": ["候选脚本1完整源码", "候选脚本2完整源码"], "test_params": [与 use 中每条轨迹一一对应的参数对象],
+ "guide": "Markdown 操作指南：给人或其他 Agent 看，不依赖本框架也能照着完成（步骤 + 注意事项 + 常见坑）",
+ "atoms": [{{"id": "kebab-case-id", "name": "...", "description": "...", "params_schema": {{...}}, "script": "完整脚本源码"}}]}}
 或：{{"skip": true, "reason": "..."}}"""
 
 
@@ -182,15 +197,27 @@ class Evolver:
             return await self._patch(run, feedback=run.feedback_comment or "用户认为结果不正确")
         if job.kind == "distill":
             return await self._distill(run)
+        if job.kind == "upgrade":
+            return await self._upgrade(run, job.skill_id or "")
         if job.kind == "shadow":
             return await self._shadow(run, job.skill_id or "", job.version)
         if job.kind == "shadow_match":
             return await self._shadow_match(run)
         return {"status": "skipped", "reason": f"未知任务类型 {job.kind}"}
 
-    async def _test(self, source: str, cases: list[TestCase], permissions: Permissions | None = None):
+    def _caller(self, overlay: dict[str, tuple[Skill, str]] | None = None, stack: tuple[str, ...] = ()) -> SkillCaller:
+        return SkillCaller(self.store, self.llms.fast, step_timeout=self.s.step_timeout, overlay=overlay, stack=stack)
+
+    async def _test(
+        self,
+        source: str,
+        cases: list[TestCase],
+        permissions: Permissions | None = None,
+        overlay: dict[str, tuple[Skill, str]] | None = None,
+    ):
         return await run_tests(
-            source, cases, registry=self.registry, llm=self.llms.fast, step_timeout=self.s.step_timeout, permissions=permissions
+            source, cases, registry=self.registry, llm=self.llms.fast, step_timeout=self.s.step_timeout,
+            permissions=permissions, skills=self._caller(overlay),
         )
 
     @property
@@ -314,10 +341,11 @@ class Evolver:
         return 0.6 * lexical_similarity(a.task, b.task) + 0.4 * _tool_seq_similarity(a, b)
 
     async def _distill(self, run: Run) -> dict[str, Any]:
+        """自由执行轨迹积累够了 → 提炼成新技能"""
         run = self.runs.get(run.id) or run
         if run.distilled_into:
             return {"status": "skipped", "reason": "已提炼"}
-        existing = [s for s in self.store.list(include_retired=True) if s.status in ("active", "shadow")]
+        existing = [s for s in self.store.list(include_retired=True) if s.status in ("active", "shadow") and s.role == "task"]
         cands = [s for s, _ in await self.matcher.candidates(run.task, existing)]
         if cands and await self.matcher.match(run.task, only=cands):
             return {"status": "skipped", "reason": "已有技能（含影子运行中的）可覆盖该任务"}
@@ -328,34 +356,106 @@ class Evolver:
         if len(cluster) < self.s.distill_min_traces:
             return {"status": "waiting", "traces": len(cluster), "need": self.s.distill_min_traces}
 
-        user = self._distill_prompt(cluster)
+        syn = await self._synthesize(cluster)
+        if syn["status"] == "skip":
+            self._mark(cluster, SKIPPED_MARK)
+            return {"status": "skipped", "reason": syn["reason"]}
+        if syn["status"] != "ok":
+            return {k: v for k, v in syn.items() if k != "status"} | {"status": syn["status"]}
+
+        atoms = self._create_atoms(syn["atoms"])
+        skill: Skill = syn["skill"]
+        skill.tests = syn["cases"]
+        skill = self.store.create(
+            skill, syn["script"], reason=f"从 {len(syn['used'])} 条轨迹提炼", pass_rate=syn["pass_rate"], shadow=self._use_shadow
+        )
+        self._mark(syn["used"], skill.id)
+        return {
+            "status": "shadow" if self._use_shadow else "created",
+            "skill_id": skill.id,
+            "traces": len(syn["used"]),
+            "pass_rate": syn["pass_rate"],
+            "attempts": syn["attempts"],
+            "candidates": syn["candidates"],
+            "atoms": atoms,
+        }
+
+    async def _upgrade(self, run: Run, skill_id: str) -> dict[str, Any]:
+        """
+        按热度升级：指南型技能被成功使用的次数够了 → 从这些轨迹提炼出流程脚本，
+        作为候选（影子运行）挂到同一个技能上，转正后这个技能就从"AI 照着指南做"变成"脚本直接执行"
+        """
+        skill = self.store.get(skill_id)
+        if skill is None or skill.kind != "guide":
+            return {"status": "skipped", "reason": "不是指南型技能"}
+        if skill.shadow:
+            return {"status": "skipped", "reason": "已有候选脚本在影子运行"}
+        runs = [
+            r for r in self.runs.list(limit=50, skill_id=skill_id)
+            if r.mode == "guide" and r.success and r.tool_call_count > 0 and not r.distilled_into
+            and (r.feedback_score is None or r.feedback_score >= 0)
+        ]
+        if len(runs) < self.s.distill_min_traces:
+            return {"status": "waiting", "skill_id": skill_id, "traces": len(runs), "need": self.s.distill_min_traces}
+
+        syn = await self._synthesize(runs[:5], upgrade=skill)
+        if syn["status"] == "skip":
+            self._mark(runs, SKIPPED_MARK)
+            return {"status": "skipped", "skill_id": skill_id, "reason": syn["reason"]}
+        if syn["status"] != "ok":
+            return {k: v for k, v in syn.items() if k != "status"} | {"status": syn["status"], "skill_id": skill_id}
+
+        atoms = self._create_atoms(syn["atoms"])
+        learned: Skill = syn["skill"]
+        skill.params_schema = learned.params_schema  # 指南型原本没有参数；转正前不影响按指南执行
+        skill.permissions = learned.permissions
+        skill.keywords = sorted(set(skill.keywords) | set(learned.keywords))
+        skill.tests = syn["cases"]
+        self.store.save(skill)
+        skill = self.store.add_version(
+            skill_id, syn["script"], reason=f"从 {len(syn['used'])} 次指南执行中提炼", pass_rate=syn["pass_rate"],
+            activate=not self._use_shadow,
+        )
+        self._mark(syn["used"], skill_id)
+        return {
+            "status": "candidate" if self._use_shadow else "promoted",
+            "skill_id": skill_id,
+            "version": skill.shadow_version or skill.active_version,
+            "traces": len(syn["used"]),
+            "candidates": syn["candidates"],
+            "atoms": atoms,
+        }
+
+    async def _synthesize(self, cluster: list[Run], *, upgrade: Skill | None = None) -> dict[str, Any]:
+        """生成多个候选脚本（可附带原子技能）→ 回放测试 → 选最好的；不达标时带着失败信息重试"""
+        n = max(1, self.s.distill_candidates)
+        system = DISTILL_SYSTEM.replace("{n}", str(n))
+        user = self._distill_prompt(cluster, upgrade)
         extra = ""
         for attempt in range(1, self.s.patch_max_attempts + 1):
-            out = await complete_json(self.llms.strong, DISTILL_SYSTEM, user + extra, purpose="distill")
+            out = await complete_json(self.llms.strong, system, user + extra, purpose="distill")
             if out.get("skip"):
-                self._mark(cluster, SKIPPED_MARK)
-                return {"status": "skipped", "reason": out.get("reason", "")}
+                return {"status": "skip", "reason": str(out.get("reason", ""))}
             try:
-                script = str(out["script"])
-                validate_script(script)
+                scripts = [str(x) for x in (out.get("scripts") or [out["script"]])][:n]
                 use = [int(i) for i in (out.get("use") or range(1, len(cluster) + 1))]
                 used = [cluster[i - 1] for i in use if 1 <= i <= len(cluster)]
                 test_params = out.get("test_params") or []
                 if not used or len(test_params) != len(used):
                     raise ValueError("use 与 test_params 数量不一致")
+                overlay = self._parse_atoms(out.get("atoms") or [])
                 skill = Skill(
-                    id=str(out.get("id") or out.get("name") or "skill"),
-                    name=str(out.get("name") or out.get("id")),
-                    description=str(out["description"]),
-                    when_to_use=str(out.get("when_to_use", "")),
+                    id=upgrade.id if upgrade else str(out.get("id") or out.get("name") or "skill"),
+                    name=upgrade.name if upgrade else str(out.get("name") or out.get("id")),
+                    description=upgrade.description if upgrade else str(out["description"]),
+                    when_to_use=upgrade.when_to_use if upgrade else str(out.get("when_to_use", "")),
                     keywords=[str(k) for k in out.get("keywords", [])],
                     params_schema=out.get("params_schema") or {"type": "object", "properties": {}},
-                    guide=str(out.get("guide") or ""),
+                    guide=upgrade.guide if upgrade else str(out.get("guide") or ""),
                 )
             except (ScriptError, KeyError, ValueError, TypeError) as e:
                 extra = f"\n\n## 上一次输出不合法\n{e}\n请修正后重新输出。"
                 continue
-
             if len(used) < self.s.distill_min_traces:
                 return {"status": "waiting", "reason": "同类轨迹不足", "traces": len(used)}
 
@@ -363,26 +463,67 @@ class Evolver:
                 TestCase(task=r.task, params=p if isinstance(p, dict) else {}, fixtures=r.trace.get("fixtures", []), source_run_id=r.id)
                 for r, p in zip(used, test_params)
             ]
-            # 学到的技能自动声明权限：用到的工具 + 轨迹中访问过的域名
-            skill.permissions = Permissions(tools=sorted(script_tools(script)), domains=self._seen_domains(used))
-            report = await self._test(script, cases, skill.permissions)
-            if report.pass_rate >= self.s.promote_min_pass_rate:
-                failed = {f["case_id"] for f in report.failures}
-                skill.tests = [c for c in cases if c.id not in failed][-self.s.max_test_cases :]
-                skill = self.store.create(
-                    skill, script, reason=f"从 {len(used)} 条轨迹提炼", pass_rate=report.pass_rate, shadow=self._use_shadow
-                )
-                self._mark(used, skill.id)
-                return {
-                    "status": "shadow" if self._use_shadow else "created",
-                    "skill_id": skill.id,
-                    "traces": len(used),
-                    "pass_rate": report.pass_rate,
-                    "attempts": attempt,
-                }
-            extra = f"\n\n## 上一次脚本的测试结果（通过率 {report.pass_rate:.0%}）\n{report.failure_text()}\n请据此修改。"
-
+            domains = self._seen_domains(used)
+            results, problems = [], []
+            for k, script in enumerate(scripts, 1):
+                try:
+                    validate_script(script)
+                    called = script_skills(script)
+                    unknown = sorted(sid for sid in called if sid not in overlay and self.store.get(sid) is None)
+                    if unknown:
+                        raise ScriptError(f"调用了不存在的技能 {', '.join(unknown)}")
+                except ScriptError as e:
+                    problems.append(f"候选 {k} 不合法: {e}")
+                    continue
+                perms = Permissions(tools=sorted(script_tools(script)), domains=domains, skills=sorted(called))
+                report = await self._test(script, cases, perms, overlay=overlay)
+                results.append((script, perms, report))
+                if report.failures:
+                    problems.append(f"候选 {k}（通过率 {report.pass_rate:.0%}）:\n{report.failure_text()}")
+            if results:
+                # 通过率优先；同等时 ctx.llm 越少越好（更确定、更省），再其次越短越好
+                script, perms, report = max(results, key=lambda r: (r[2].pass_rate, -count_llm_calls(r[0]), -len(r[0])))
+                if report.pass_rate >= self.s.promote_min_pass_rate:
+                    failed = {f["case_id"] for f in report.failures}
+                    skill.permissions = perms
+                    return {
+                        "status": "ok",
+                        "skill": skill,
+                        "script": script,
+                        "cases": [c for c in cases if c.id not in failed][-self.s.max_test_cases :],
+                        "pass_rate": report.pass_rate,
+                        "used": used,
+                        "attempts": attempt,
+                        "candidates": len(scripts),
+                        "atoms": overlay,
+                    }
+            extra = "\n\n## 上一次的候选都没有通过测试\n" + "\n".join(problems) + "\n请据此修改。"
         return {"status": "rejected", "reason": "提炼的脚本测试未达标", "detail": extra.strip()}
+
+    def _parse_atoms(self, raw: list[Any]) -> dict[str, tuple[Skill, str]]:
+        overlay: dict[str, tuple[Skill, str]] = {}
+        for a in raw:
+            sid = slugify(str(a.get("id") or a.get("name") or ""))
+            if self.store.get(sid) is not None:
+                raise ValueError(f"原子技能 id {sid} 已存在，请直接用 ctx.skill 复用它或换一个 id")
+            source = str(a["script"])
+            validate_script(source)
+            atom = Skill(
+                id=sid,
+                name=str(a.get("name") or sid),
+                description=str(a.get("description") or ""),
+                params_schema=a.get("params_schema") or {"type": "object", "properties": {}},
+                role="atomic",
+                permissions=Permissions(tools=sorted(script_tools(source)), skills=sorted(script_skills(source))),
+            )
+            overlay[sid] = (atom, source)
+        return overlay
+
+    def _create_atoms(self, overlay: dict[str, tuple[Skill, str]]) -> list[str]:
+        created = []
+        for sid, (atom, source) in overlay.items():
+            created.append(self.store.create(atom, source, reason="提炼时抽出的原子技能").id)
+        return created
 
     def _seen_domains(self, runs: list[Run]) -> list[str]:
         hosts = set()
@@ -403,6 +544,11 @@ class Evolver:
         if not run.success:
             return {"status": "skipped", "reason": "真实运行未成功，无法比对"}
         params = (run.trace.get("match") or {}).get("params", {})
+        if run.mode == "guide":  # 指南型执行时没有参数，按候选脚本的参数 schema 抽取
+            m = await self.matcher.match(run.task, only=[skill])
+            if m is None:
+                return {"status": "skipped", "skill_id": skill.id, "reason": "无法为候选脚本抽取参数"}
+            params = m.params
         res = await self._run_shadow(skill, skill.shadow.version, run, params)
         if res.guard_rejected:
             return self._record_shadow(skill, run, False, f"候选版本的前置检查拒绝了本该适用的任务: {res.error}")
@@ -432,6 +578,8 @@ class Evolver:
             toolbox=toolbox,
             llm=self.llms.fast,
             step_timeout=self.s.step_timeout,
+            skills=self._caller(stack=(skill.id,)),
+            skill_allowlist=skill.permissions.skills,
         )
 
     async def _judge_and_record(self, skill: Skill, run: Run, res) -> dict[str, Any]:
@@ -471,14 +619,31 @@ class Evolver:
         self.store.save_shadow(skill)
         return {**base, "status": "shadow_pass" if agree else "shadow_fail"}
 
-    def _distill_prompt(self, cluster: list[Run]) -> str:
+    def _distill_prompt(self, cluster: list[Run], upgrade: Skill | None = None) -> str:
         parts = []
+        if upgrade is not None:
+            parts.append(
+                f"## 这是指南型技能「{upgrade.id}」的使用轨迹\n它目前由 AI 照着下面的指南执行。请把它固化为流程脚本"
+                f"（id、name、description 沿用原技能，guide 可以留空）：\n\n{upgrade.guide[:4000]}\n"
+            )
         for i, r in enumerate(cluster, 1):
             parts.append(
                 f"### 轨迹 {i}\n任务: {r.task}\n工具调用:\n{_fmt_calls(r.trace.get('tool_calls', []), 800)}\n"
                 f"最终结果: {json.dumps(truncate(r.result, 1500), ensure_ascii=False, default=str)}"
             )
-        return "## 执行轨迹\n\n" + "\n\n".join(parts) + f"\n\n## 可用工具\n{self.registry.describe()}"
+        reusable = [
+            s for s in self.store.list() if s.kind == "flow" and (upgrade is None or s.id != upgrade.id)
+        ][:30]
+        lib = "\n".join(
+            f"- {s.id}（{'原子' if s.role == 'atomic' else '任务'}）参数 {json.dumps(s.params_schema.get('properties', {}), ensure_ascii=False)}：{s.description}"
+            for s in reusable
+        )
+        head, body = (parts[0] + "\n", parts[1:]) if upgrade is not None else ("", parts)
+        return (
+            head + "## 执行轨迹\n\n" + "\n\n".join(body)
+            + f"\n\n## 可用工具\n{self.registry.describe()}"
+            + (f"\n\n## 可复用的已有技能（用 ctx.skill 调用）\n{lib}" if lib else "")
+        )
 
     def _mark(self, runs: list[Run], value: str) -> None:
         for r in runs:

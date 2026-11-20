@@ -32,6 +32,8 @@ def create_router(agent: Agent | Callable[[], Agent]) -> APIRouter:
             description=s.description,
             status=s.status,
             kind=s.kind,
+            role=s.role,
+            trust=getattr(a.store, "trust", {}).get(s.id),
             layer=a.store.layer(s.id),
             active_version=s.active_version,
             shadow_version=s.shadow_version,

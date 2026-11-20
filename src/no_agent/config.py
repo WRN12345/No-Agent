@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -71,6 +73,15 @@ class McpServerConfig(BaseModel):
     confirm_destructive: bool = True  # destructiveHint=true 的工具执行前请求用户确认
 
 
+class SkillRepoConfig(BaseModel):
+    """以只读方式使用的 git 技能仓库（no-agent sync 拉取 / 更新）"""
+
+    url: str
+    ref: str | None = None  # 分支 / 标签；None 用默认分支
+    name: str | None = None  # 本地目录名；None 由 url 推断
+    subdir: str = ""  # 技能所在的子目录
+
+
 class AgentConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
@@ -80,6 +91,12 @@ class AgentConfig(BaseModel):
     home: Path | None = None  # 数据根目录；为空时：环境变量 NO_AGENT_HOME > 向上查找 .no-agent/ > ./.no-agent
     skills_dir: Path | None = None  # 可写技能层；默认 <home>/skills
     extra_skill_dirs: list[Path] = []  # 只读技能层（团队共享库等），排在前面的优先级低
+    skill_repos: list[SkillRepoConfig] = []  # git 技能仓库（同步到 <home>/repos/，作为只读层）
+    trusted_signers: dict[str, str] = {}  # 签名者 → Ed25519 公钥（base64）
+    # 共享技能（extra_skill_dirs / skill_repos）没有可信签名时：
+    #   shadow → 流程型先影子运行、比对通过后才生效；指南型不自动使用（默认，可靠优先）
+    #   allow  → 直接信任
+    untrusted_shared: Literal["shadow", "allow"] = "shadow"
     database_url: str | None = None  # 运行记录；默认 sqlite:///<home>/runs.db，生产可用 postgresql://...
     workspace_dir: Path | None = None  # 工具工作区；默认 <home>/workspace
 
@@ -97,6 +114,7 @@ class AgentConfig(BaseModel):
     # ── 进化 ──
     distill_min_traces: int = 2  # 积累多少条相似的成功轨迹后提炼新技能
     distill_similarity: float = 0.45
+    distill_candidates: int = 2  # 提炼时一次生成几个候选脚本，回放测试后选最好的
     patch_max_attempts: int = 2
     promote_min_pass_rate: float = 0.8  # 新版本回归测试通过率达到此值，才进入影子运行
     shadow_min_runs: int = 3  # 影子运行与真实结果一致多少次后自动转正；0 = 测试通过即上线（不做影子运行）

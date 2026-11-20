@@ -27,7 +27,7 @@ class StepFailure(Exception):
 class StepContext:
     """注入给每个步骤的 ctx"""
 
-    def __init__(self, *, task: str, params: dict[str, Any], toolbox: Toolbox, llm: BaseLLM) -> None:
+    def __init__(self, *, task: str, params: dict[str, Any], toolbox: Toolbox, llm: BaseLLM, skills: Any = None) -> None:
         self.task = task
         self.params = params
         self.state: dict[str, Any] = {}
@@ -35,6 +35,8 @@ class StepContext:
         self.logs: list[str] = []
         self._toolbox = toolbox
         self._llm = llm
+        self._skills = skills  # SkillCaller；None 表示当前环境不支持调用子技能
+        self._skill_allowlist: set[str] = set()
         self._step: str | None = None
 
     async def tool(self, name: str, **args: Any) -> Any:
@@ -52,6 +54,22 @@ class StepContext:
             content += "\n\n只输出一个 JSON 对象。"
         reply = await self._llm.complete([{"role": "user", "content": content}], purpose="script_llm")
         return parse_json(reply.content) if json else reply.content.strip()
+
+    async def skill(self, skill_id: str, **params: Any) -> Any:
+        """调用另一个流程型技能（在它自己的权限下运行），返回它的结果；失败时本步骤失败"""
+        from no_agent.skills.compose import SkillCallError
+
+        if self._step == GUARD_STEP:
+            raise StepFailure("guard 中不能调用子技能")
+        if self._skills is None:
+            raise StepFailure("当前环境不支持调用子技能")
+        allowed = self._toolbox.allowed_tools
+        if allowed is not None and skill_id not in self._skill_allowlist:
+            raise StepFailure(f"技能未声明调用子技能 {skill_id}")
+        try:
+            return await self._skills.call(skill_id, params, toolbox=self._toolbox, task=self.task)
+        except SkillCallError as e:
+            raise StepFailure(str(e)) from e
 
     async def ask(self, questions: list[dict[str, Any]], title: str = "") -> dict[str, Any]:
         """一次性向用户提出多个问题，返回 {key: 回答}"""
@@ -146,13 +164,20 @@ async def execute_script(
     toolbox: Toolbox,
     llm: BaseLLM,
     step_timeout: float = 60.0,
+    skills: Any = None,
+    skill_allowlist: list[str] | None = None,
 ) -> ExecutionResult:
+    """
+    skills：SkillCaller，提供 ctx.skill()；skill_allowlist：本技能声明可调用的子技能
+    （仅在 toolbox 有工具限制时生效）
+    """
     try:
         loaded = load_script(source)
     except ScriptError as e:
         return ExecutionResult(success=False, failed_step="<load>", error=str(e))
 
-    ctx = StepContext(task=task, params=params, toolbox=toolbox, llm=llm)
+    ctx = StepContext(task=task, params=params, toolbox=toolbox, llm=llm, skills=skills)
+    ctx._skill_allowlist = set(skill_allowlist or [])
     res = ExecutionResult(success=False, all_steps=[s.name for s in loaded.steps])
 
     def finish(ok: bool, step: str | None = None, error: str | None = None) -> ExecutionResult:
