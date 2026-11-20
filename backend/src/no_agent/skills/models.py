@@ -32,6 +32,25 @@ class VersionInfo(BaseModel):
     reason: str = ""
     parent: int | None = None
     test_pass_rate: float | None = None
+    # candidate：影子运行中 | active：当前版本 | superseded：曾经上线、已被替换 | rejected：影子运行未通过
+    status: Literal["candidate", "active", "superseded", "rejected"] = "active"
+    note: str = ""
+
+
+class ShadowRecord(BaseModel):
+    run_id: str
+    agree: bool
+    reason: str = ""
+    at: datetime = Field(default_factory=_now)
+
+
+class ShadowState(BaseModel):
+    """候选版本的影子运行记录"""
+
+    version: int
+    passes: int = 0
+    failures: int = 0
+    log: list[ShadowRecord] = []
 
 
 class SkillStats(BaseModel):
@@ -115,14 +134,20 @@ class Skill(BaseModel):
     keywords: list[str] = []
     params_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
     permissions: Permissions = Field(default_factory=Permissions)
-    status: Literal["active", "retired"] = "active"
+    # active：正常使用 | shadow：新提炼的技能，影子运行中，尚未对外生效 | retired：已下线
+    status: Literal["active", "shadow", "retired"] = "active"
     active_version: int = 0  # 0 = 没有流程脚本（指南型）
     versions: list[VersionInfo] = []
+    shadow: ShadowState | None = None  # 有候选版本在影子运行时非空
     guide: str = ""  # SKILL.md 正文（L3 指南）
     tests: list[TestCase] = []
     stats: SkillStats = Field(default_factory=SkillStats)
     created_at: datetime = Field(default_factory=_now)
     updated_at: datetime = Field(default_factory=_now)
+
+    @property
+    def shadow_version(self) -> int | None:
+        return self.shadow.version if self.shadow else None
 
     @property
     def kind(self) -> Literal["flow", "guide"]:

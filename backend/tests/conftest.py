@@ -82,5 +82,5 @@ def strong() -> FakeLLM:
 
 @pytest.fixture
 def agent(tmp_path, fast, strong, web) -> Agent:
-    config = AgentConfig(home=tmp_path / ".no-agent", distill_min_traces=2)
+    config = AgentConfig(home=tmp_path / ".no-agent", distill_min_traces=2, shadow_min_runs=0)  # 影子运行另有专门测试
     return Agent(config, tools=[web.tool()], include_builtin_tools=False, llms=LLMs(fast=fast, strong=strong))

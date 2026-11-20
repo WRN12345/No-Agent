@@ -28,9 +28,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 from no_agent.skills import skillmd
-from no_agent.skills.models import Skill, SkillStats, TestCase, VersionInfo
-from no_agent.skills.script import ScriptError, step_docs, validate_script
+from no_agent.skills.models import ShadowState, Skill, SkillStats, TestCase, VersionInfo
+from no_agent.skills.script import ScriptError, script_tools, step_docs, validate_script
 from no_agent.storage.base import SKILL_SCHEMA_VERSION as SCHEMA_VERSION
+from no_agent.tools.base import ALWAYS_ALLOWED
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +201,8 @@ class FileSkillStore:
 
     # ── 写入 ──
 
-    def create(self, skill: Skill, script: str, *, reason: str, pass_rate: float | None = None) -> Skill:
+    def create(self, skill: Skill, script: str, *, reason: str, pass_rate: float | None = None, shadow: bool = False) -> Skill:
+        """新建流程型技能；shadow=True 时先进入影子运行，转正前不会被匹配使用"""
         with self._lock:
             base = slugify(skill.id or skill.name)
             sid, n = base, 2
@@ -208,7 +210,10 @@ class FileSkillStore:
                 sid, n = f"{base}-{n}", n + 1
             skill.id = sid
             skill.active_version = 1
-            skill.versions = [VersionInfo(version=1, reason=reason, test_pass_rate=pass_rate)]
+            skill.versions = [VersionInfo(version=1, reason=reason, test_pass_rate=pass_rate, status="candidate" if shadow else "active")]
+            if shadow:
+                skill.status = "shadow"
+                skill.shadow = ShadowState(version=1)
             if not skill.guide.strip():
                 skill.guide = skillmd.default_body(skill, step_docs(script), script_relpath(1))
             d = self.root / sid
@@ -218,26 +223,81 @@ class FileSkillStore:
             self.save(skill)
             return skill
 
-    def add_version(self, skill_id: str, script: str, *, reason: str, pass_rate: float | None) -> Skill:
+    def add_version(self, skill_id: str, script: str, *, reason: str, pass_rate: float | None, activate: bool = True) -> Skill:
+        """
+        新增版本。activate=True 直接上线；False 作为候选版本进入影子运行（替换掉之前的候选）。
+        """
         with self._lock:
             skill = self._require(skill_id)
             d = self._ensure_local(skill_id)
             v = max((x.version for x in skill.versions), default=0) + 1
             _write_atomic(d / script_relpath(v), script)
-            skill.versions.append(VersionInfo(version=v, reason=reason, parent=skill.active_version or None, test_pass_rate=pass_rate))
-            skill.active_version = v
-            skill.stats.recent = []  # 新版本重新积累成功率
+            parent = skill.shadow_version or skill.active_version or None
+            skill.versions.append(VersionInfo(version=v, reason=reason, parent=parent, test_pass_rate=pass_rate, status="candidate"))
+            if skill.shadow:  # 被新的候选取代
+                self._version(skill, skill.shadow.version).status = "rejected"
+                self._version(skill, skill.shadow.version).note = f"被 v{v} 取代"
+            if activate:
+                self._activate(skill, v)
+            else:
+                skill.shadow = ShadowState(version=v)
+                if skill.status == "shadow":  # 新技能还在影子期：直接以新版本继续
+                    skill.active_version = v
             self.save(skill)
             return skill
+
+    def promote(self, skill_id: str) -> Skill:
+        """候选版本转正"""
+        with self._lock:
+            skill = self._require(skill_id)
+            if skill.shadow is None:
+                raise ValueError(f"{skill_id} 没有候选版本")
+            self._activate(skill, skill.shadow.version)
+            skill.status = "active"
+            self.save(skill)
+            return skill
+
+    def reject_shadow(self, skill_id: str, reason: str) -> Skill:
+        """淘汰候选版本；新技能的唯一版本被淘汰时整个技能下线"""
+        with self._lock:
+            skill = self._require(skill_id)
+            if skill.shadow is None:
+                raise ValueError(f"{skill_id} 没有候选版本")
+            info = self._version(skill, skill.shadow.version)
+            info.status, info.note = "rejected", reason
+            skill.shadow = None
+            if skill.status == "shadow":
+                skill.status = "retired"
+            self.save(skill)
+            return skill
+
+    def save_shadow(self, skill: Skill) -> None:
+        """保存影子运行进度"""
+        self.save(skill)
+
+    def _activate(self, skill: Skill, version: int) -> None:
+        for x in skill.versions:
+            if x.status == "active" and x.version != version:
+                x.status = "superseded"
+        self._version(skill, version).status = "active"
+        skill.active_version = version
+        if skill.shadow and skill.shadow.version == version:
+            skill.shadow = None
+        skill.stats.recent = []  # 新版本重新积累成功率
+
+    @staticmethod
+    def _version(skill: Skill, version: int) -> VersionInfo:
+        for x in skill.versions:
+            if x.version == version:
+                return x
+        raise KeyError(f"{skill.id} 没有版本 v{version}")
 
     def set_active(self, skill_id: str, version: int) -> Skill:
         with self._lock:
             skill = self._require(skill_id)
-            if not any(x.version == version for x in skill.versions):
-                raise KeyError(f"{skill_id} 没有版本 v{version}")
-            skill.active_version = version
+            self._version(skill, version)
+            self._activate(skill, version)
             skill.status = "active"
-            skill.stats.recent = []
             self.save(skill)
             return skill
 
@@ -272,9 +332,13 @@ class FileSkillStore:
             if not p.is_file():
                 p = src / f"v{v.version}.py"  # 旧格式
             try:
-                validate_script(p.read_text(encoding="utf-8"))
+                source = p.read_text(encoding="utf-8")
+                validate_script(source)
             except (OSError, ScriptError) as e:
                 raise ValueError(f"流程脚本 v{v.version} 不合法: {e}") from e
+            declared = set(skill.permissions.tools)
+            if declared and (undeclared := script_tools(source) - declared - ALWAYS_ALLOWED):
+                raise ValueError(f"流程脚本 v{v.version} 使用了未声明的工具: {', '.join(sorted(undeclared))}")
         with self._lock:
             target = self.root / skill.id
             if target.exists():

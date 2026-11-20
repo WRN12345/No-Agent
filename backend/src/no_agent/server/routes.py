@@ -34,6 +34,9 @@ def create_router(agent: Agent | Callable[[], Agent]) -> APIRouter:
             kind=s.kind,
             layer=a.store.layer(s.id),
             active_version=s.active_version,
+            shadow_version=s.shadow_version,
+            shadow_passes=s.shadow.passes if s.shadow else 0,
+            shadow_failures=s.shadow.failures if s.shadow else 0,
             versions=len(s.versions),
             tests=len(s.tests),
             runs=st.runs,
@@ -135,6 +138,24 @@ def create_router(agent: Agent | Callable[[], Agent]) -> APIRouter:
             return _summary(a, a.store.set_active(skill_id, req.version))
         except KeyError as e:
             raise HTTPException(404, str(e)) from e
+
+    @router.post("/skills/{skill_id}/promote", tags=["skills"])
+    async def promote_candidate(skill_id: str, a: Agent = Depends(get_agent)) -> SkillSummary:
+        """手动让影子运行中的候选版本立即转正"""
+        _skill(a, skill_id)
+        try:
+            return _summary(a, a.store.promote(skill_id))
+        except ValueError as e:
+            raise HTTPException(409, str(e)) from e
+
+    @router.post("/skills/{skill_id}/reject", tags=["skills"])
+    async def reject_candidate(skill_id: str, a: Agent = Depends(get_agent)) -> SkillSummary:
+        """手动淘汰影子运行中的候选版本"""
+        _skill(a, skill_id)
+        try:
+            return _summary(a, a.store.reject_shadow(skill_id, "手动淘汰"))
+        except ValueError as e:
+            raise HTTPException(409, str(e)) from e
 
     @router.post("/skills/{skill_id}/retire", tags=["skills"])
     async def retire_skill(skill_id: str, a: Agent = Depends(get_agent)) -> SkillSummary:

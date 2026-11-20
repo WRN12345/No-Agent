@@ -218,6 +218,7 @@ async def _settle(page: Any) -> None:
 def make_browser_tools(session: BrowserSession) -> list[Tool]:
     @tool(
         "browser_open",
+        url_arg="url",
         description="在浏览器中打开网址",
         parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
     )

@@ -71,6 +71,7 @@ _MAX_BODY = 100_000
 
 @tool(
     "http_request",
+    url_arg="url",
     description="发送 HTTP 请求，返回 {status, content_type, body}。body 超过 100k 字符会截断。",
     parameters={
         "type": "object",

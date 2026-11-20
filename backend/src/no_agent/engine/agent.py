@@ -90,14 +90,22 @@ class EvolvingAgent:
                 ff, abort = await self._freeform(task, toolbox, None, guide=match.skill)
             elif match:
                 source = self.store.script(match.skill.id)
-                exe = await execute_script(
-                    source, task=task, params=match.params, toolbox=toolbox, llm=self.llms.fast, step_timeout=self.s.step_timeout
-                )
+                perms = match.skill.permissions
+                toolbox.restrict(perms.tools, perms.domains)  # 脚本只能用声明过的工具 / 域名
+                try:
+                    exe = await execute_script(
+                        source, task=task, params=match.params, toolbox=toolbox, llm=self.llms.fast, step_timeout=self.s.step_timeout
+                    )
+                finally:
+                    toolbox.restrict(None, None)  # AI 接管不受技能权限限制
                 trace["execution"] = exe.summary()
                 if exe.aborted:
                     abort = exe.error
                 elif not exe.success:
-                    logger.info("技能 %s 在 %s 失败: %s → AI 接管", match.skill.id, exe.failed_step, exe.error)
+                    if exe.guard_rejected:
+                        logger.info("技能 %s 前置检查未通过: %s → AI 接管（未执行任何步骤）", match.skill.id, exe.error)
+                    else:
+                        logger.info("技能 %s 在 %s 失败: %s → AI 接管", match.skill.id, exe.failed_step, exe.error)
                     trace["state_at_failure"] = exe.state
                     takeover = TakeoverContext(
                         skill_id=match.skill.id,
@@ -106,7 +114,7 @@ class EvolvingAgent:
                         done_steps=[s.name for s in exe.steps if s.ok],
                         failed_step=exe.failed_step or "",
                         error=exe.error or "",
-                        failed_source=function_source(source, exe.failed_step or "") or "",
+                        failed_source=function_source(source, "guard" if exe.guard_rejected else exe.failed_step or "") or "",
                         params=match.params,
                         state=exe.state,
                         side_effects=toolbox.side_effect_calls(),
@@ -152,6 +160,7 @@ class EvolvingAgent:
 
         if abort:
             return run
+        self._submit_shadow(run, match)
         if match:
             self._record_skill(match, exe, success, latency)
             if run_mode == "skill_takeover" and success:  # 只有流程型会走到接管
@@ -160,6 +169,17 @@ class EvolvingAgent:
             # 没用工具的纯问答不值得提炼
             self.evolver.submit(Job("distill", run.id))
         return run
+
+    def _submit_shadow(self, run: Run, match: MatchResult | None) -> None:
+        """真实运行成功后，让候选版本 / 影子技能在后台用这次的录制数据跑一遍，用于比对转正"""
+        if not run.success:
+            return
+        if match and match.skill.kind == "flow":
+            skill = self.store.get(match.skill.id)
+            if skill and skill.shadow:
+                self.evolver.submit(Job("shadow", run.id, skill_id=skill.id, version=skill.shadow.version))
+        elif any(s.status == "shadow" for s in self.store.list(include_retired=True)):
+            self.evolver.submit(Job("shadow_match", run.id))
 
     async def _select(self, task: str, mode: RunMode, skill_id: str | None, params: dict | None) -> MatchResult | None:
         if mode == "freeform":

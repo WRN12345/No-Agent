@@ -25,9 +25,10 @@ from no_agent.llm import LLMs, complete_json, metered
 from no_agent.storage.base import RunStore, SkillStore
 from no_agent.storage.sql import Run
 from no_agent.skills.matcher import SkillMatcher, lexical_similarity
-from no_agent.skills.models import Skill, TestCase
-from no_agent.skills.script import SCRIPT_API_DOC, ScriptError, numbered, replace_functions, validate_script
-from no_agent.tools.base import ToolRegistry, truncate
+from no_agent.skills.models import Permissions, ShadowRecord, Skill, TestCase
+from no_agent.skills.runtime import execute_script
+from no_agent.skills.script import SCRIPT_API_DOC, ScriptError, numbered, replace_functions, script_tools, validate_script
+from no_agent.tools.base import ALWAYS_ALLOWED, ReplayToolbox, ToolRegistry, host_of, truncate
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +37,10 @@ SKIPPED_MARK = "__skipped__"  # 提炼器判定不值得做成技能的轨迹
 
 @dataclass
 class Job:
-    kind: Literal["patch", "feedback", "distill"]
+    kind: Literal["patch", "feedback", "distill", "shadow", "shadow_match"]
     run_id: str
+    skill_id: str | None = None
+    version: int | None = None
 
 
 PATCH_SYSTEM = f"""你是技能脚本的维护者。一个自动化技能脚本执行出了问题，你要修改脚本，让它以后能自动正确处理这种情况。
@@ -88,6 +91,15 @@ def _fmt_calls(calls: list[dict[str, Any]], limit: int = 1200) -> str:
             f"{json.dumps(truncate(out, limit), ensure_ascii=False, default=str)}"
         )
     return "\n".join(lines) or "（无）"
+
+
+JUDGE_SYSTEM = """你在比对同一个任务的两个结果，判断它们是否等价：是否同样正确地完成了任务、给出了相同的关键信息。
+忽略字段顺序、格式、措辞、多余的说明文字；关键数据（数值、名称、状态、是否完成）不同就不等价。
+只输出 JSON：{"same": true 或 false, "reason": "一句话理由"}"""
+
+
+def _canonical(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
 
 
 def _tool_seq_similarity(a: Run, b: Run) -> float:
@@ -170,10 +182,28 @@ class Evolver:
             return await self._patch(run, feedback=run.feedback_comment or "用户认为结果不正确")
         if job.kind == "distill":
             return await self._distill(run)
+        if job.kind == "shadow":
+            return await self._shadow(run, job.skill_id or "", job.version)
+        if job.kind == "shadow_match":
+            return await self._shadow_match(run)
         return {"status": "skipped", "reason": f"未知任务类型 {job.kind}"}
 
-    async def _test(self, source: str, cases: list[TestCase]):
-        return await run_tests(source, cases, registry=self.registry, llm=self.llms.fast, step_timeout=self.s.step_timeout)
+    async def _test(self, source: str, cases: list[TestCase], permissions: Permissions | None = None):
+        return await run_tests(
+            source, cases, registry=self.registry, llm=self.llms.fast, step_timeout=self.s.step_timeout, permissions=permissions
+        )
+
+    @property
+    def _use_shadow(self) -> bool:
+        return self.s.shadow_min_runs > 0
+
+    @staticmethod
+    def _undeclared(skill: Skill, source: str) -> list[str]:
+        """脚本用到、但技能没有声明的工具（未声明任何工具的技能不受限）"""
+        declared = set(skill.permissions.tools)
+        if not declared:
+            return []
+        return sorted(script_tools(source) - declared - ALWAYS_ALLOWED)
 
     # ── 修补 ──
 
@@ -183,16 +213,19 @@ class Evolver:
             return {"status": "skipped", "reason": "技能不存在"}
         trace = run.trace
         params = (trace.get("match") or {}).get("params", {})
-        source = self.store.script(skill.id)
+        # 有候选版本时在候选的基础上继续改（它是更新的尝试）
+        base_version = skill.shadow_version or skill.active_version
+        source = self.store.script(skill.id, base_version)
 
         # 接管成功的运行 → 作为新的回归用例；反馈修补没有"正确答案"，不新增用例
         new_case = None
         if feedback is None:
             new_case = TestCase(task=run.task, params=params, fixtures=trace.get("fixtures", []), source_run_id=run.id)
-            # 当前版本可能已经被别的任务修好了
-            if (await self._test(source, [new_case])).passed:
+            # 当前版本 / 候选版本可能已经能处理这种情况了
+            if (await self._test(source, [new_case], skill.permissions)).passed:
                 self.store.add_test(skill, new_case, self.s.max_test_cases)
-                return {"status": "skipped", "skill_id": skill.id, "reason": "当前版本已能通过该用例"}
+                which = "候选版本" if skill.shadow else "当前版本"
+                return {"status": "skipped", "skill_id": skill.id, "reason": f"{which}已能通过该用例"}
 
         cases = skill.tests + ([new_case] if new_case else [])
         if not cases:
@@ -210,21 +243,28 @@ class Evolver:
                 else:
                     new_source = replace_functions(source, {k: str(v) for k, v in (out.get("functions") or {}).items()})
                 validate_script(new_source)
+                if undeclared := self._undeclared(skill, new_source):
+                    raise ScriptError(
+                        f"使用了技能未声明的工具 {', '.join(undeclared)}。技能权限只能由人修改，"
+                        f"只能使用已声明的工具：{', '.join(skill.permissions.tools)}"
+                    )
             except (ScriptError, KeyError, SyntaxError) as e:
                 extra = f"\n\n## 上一次修改不合法\n{e}\n请修正后重新输出。"
                 continue
 
-            report = await self._test(new_source, cases)
+            report = await self._test(new_source, cases, skill.permissions)
             new_case_ok = new_case is None or all(f["case_id"] != new_case.id for f in report.failures)
             if new_case_ok and report.pass_rate >= self.s.promote_min_pass_rate:
                 reason = str(out.get("reason", ""))
-                skill = self.store.add_version(skill.id, new_source, reason=reason, pass_rate=report.pass_rate)
+                skill = self.store.add_version(
+                    skill.id, new_source, reason=reason, pass_rate=report.pass_rate, activate=not self._use_shadow
+                )
                 if new_case:
                     self.store.add_test(skill, new_case, self.s.max_test_cases)
                 return {
-                    "status": "promoted",
+                    "status": "candidate" if self._use_shadow else "promoted",
                     "skill_id": skill.id,
-                    "version": skill.active_version,
+                    "version": skill.shadow_version or skill.active_version,
                     "pass_rate": report.pass_rate,
                     "attempts": attempt,
                     "reason": reason,
@@ -258,6 +298,12 @@ class Evolver:
                 f"## 脚本的工具调用\n{_fmt_calls(trace.get('tool_calls', []))}",
                 f"## 脚本输出的结果\n{json.dumps(truncate(run.result, 2000), ensure_ascii=False, default=str)}",
             ]
+        rejected = [v for v in skill.versions if v.status == "rejected" and v.note]
+        if rejected:
+            notes = "\n".join(f"- v{v.version}：{v.note}" for v in rejected[-3:])
+            parts.append(f"## 之前被淘汰的修补（不要重复同样的问题）\n{notes}")
+        if skill.permissions.tools:
+            parts.append(f"## 技能权限（只能使用这些工具，不能扩大）\n{', '.join(skill.permissions.tools)}")
         parts.append(f"## 可用工具\n{self.registry.describe()}")
         return "\n\n".join(parts)
 
@@ -271,8 +317,10 @@ class Evolver:
         run = self.runs.get(run.id) or run
         if run.distilled_into:
             return {"status": "skipped", "reason": "已提炼"}
-        if self.store.list() and await self.matcher.match(run.task):
-            return {"status": "skipped", "reason": "已有技能可覆盖该任务"}
+        existing = [s for s in self.store.list(include_retired=True) if s.status in ("active", "shadow")]
+        cands = [s for s, _ in await self.matcher.candidates(run.task, existing)]
+        if cands and await self.matcher.match(run.task, only=cands):
+            return {"status": "skipped", "reason": "已有技能（含影子运行中的）可覆盖该任务"}
 
         pool = [r for r in self.runs.distill_candidates() if r.id != run.id]
         similar = sorted(((r, self._run_similarity(run, r)) for r in pool), key=lambda x: x[1], reverse=True)
@@ -315,16 +363,113 @@ class Evolver:
                 TestCase(task=r.task, params=p if isinstance(p, dict) else {}, fixtures=r.trace.get("fixtures", []), source_run_id=r.id)
                 for r, p in zip(used, test_params)
             ]
-            report = await self._test(script, cases)
+            # 学到的技能自动声明权限：用到的工具 + 轨迹中访问过的域名
+            skill.permissions = Permissions(tools=sorted(script_tools(script)), domains=self._seen_domains(used))
+            report = await self._test(script, cases, skill.permissions)
             if report.pass_rate >= self.s.promote_min_pass_rate:
                 failed = {f["case_id"] for f in report.failures}
                 skill.tests = [c for c in cases if c.id not in failed][-self.s.max_test_cases :]
-                skill = self.store.create(skill, script, reason=f"从 {len(used)} 条轨迹提炼", pass_rate=report.pass_rate)
+                skill = self.store.create(
+                    skill, script, reason=f"从 {len(used)} 条轨迹提炼", pass_rate=report.pass_rate, shadow=self._use_shadow
+                )
                 self._mark(used, skill.id)
-                return {"status": "created", "skill_id": skill.id, "traces": len(used), "pass_rate": report.pass_rate, "attempts": attempt}
+                return {
+                    "status": "shadow" if self._use_shadow else "created",
+                    "skill_id": skill.id,
+                    "traces": len(used),
+                    "pass_rate": report.pass_rate,
+                    "attempts": attempt,
+                }
             extra = f"\n\n## 上一次脚本的测试结果（通过率 {report.pass_rate:.0%}）\n{report.failure_text()}\n请据此修改。"
 
         return {"status": "rejected", "reason": "提炼的脚本测试未达标", "detail": extra.strip()}
+
+    def _seen_domains(self, runs: list[Run]) -> list[str]:
+        hosts = set()
+        for r in runs:
+            for c in r.trace.get("tool_calls", []):
+                t = self.registry.get(c["tool"])
+                if t and t.url_arg and (h := host_of(str(c["args"].get(t.url_arg, "")))):
+                    hosts.add(h)
+        return sorted(hosts)
+
+    # ── 影子运行 ──
+
+    async def _shadow(self, run: Run, skill_id: str, version: int | None) -> dict[str, Any]:
+        """真实运行之后，用它的录制数据在影子环境里跑一遍候选版本，比对结果"""
+        skill = self.store.get(skill_id)
+        if skill is None or skill.shadow is None or skill.shadow.version != version:
+            return {"status": "skipped", "reason": "候选版本已变化"}
+        if not run.success:
+            return {"status": "skipped", "reason": "真实运行未成功，无法比对"}
+        params = (run.trace.get("match") or {}).get("params", {})
+        res = await self._run_shadow(skill, skill.shadow.version, run, params)
+        if res.guard_rejected:
+            return self._record_shadow(skill, run, False, f"候选版本的前置检查拒绝了本该适用的任务: {res.error}")
+        return await self._judge_and_record(skill, run, res)
+
+    async def _shadow_match(self, run: Run) -> dict[str, Any]:
+        """新提炼的技能还在影子期：看这次运行的任务是否属于它，属于就影子跑一遍"""
+        if not run.success:
+            return {"status": "skipped", "reason": "真实运行未成功"}
+        shadows = [s for s in self.store.list(include_retired=True) if s.status == "shadow" and s.shadow]
+        cands = [s for s, _ in await self.matcher.candidates(run.task, shadows)]
+        m = await self.matcher.match(run.task, only=cands) if cands else None
+        if m is None or m.skill.shadow is None:
+            return {"status": "skipped", "reason": "没有匹配的影子技能"}
+        res = await self._run_shadow(m.skill, m.skill.shadow.version, run, m.params)
+        if res.guard_rejected:  # 新技能自己判定不适用：说明匹配错了，不计入
+            return {"status": "skipped", "skill_id": m.skill.id, "reason": f"影子技能判定不适用: {res.error}"}
+        return await self._judge_and_record(m.skill, run, res)
+
+    async def _run_shadow(self, skill: Skill, version: int, run: Run, params: dict[str, Any]):
+        toolbox = ReplayToolbox(self.registry, run.trace.get("fixtures", []), timeout=self.s.tool_timeout)
+        toolbox.restrict(skill.permissions.tools, skill.permissions.domains)
+        return await execute_script(
+            self.store.script(skill.id, version),
+            task=run.task,
+            params=params,
+            toolbox=toolbox,
+            llm=self.llms.fast,
+            step_timeout=self.s.step_timeout,
+        )
+
+    async def _judge_and_record(self, skill: Skill, run: Run, res) -> dict[str, Any]:
+        if not res.success:
+            return self._record_shadow(skill, run, False, f"候选版本在 {res.failed_step} 失败: {res.error}")
+        agree, reason = await self._agree(run.task, run.result, res.result)
+        return self._record_shadow(skill, run, agree, reason)
+
+    async def _agree(self, task: str, real: Any, shadow: Any) -> tuple[bool, str]:
+        if _canonical(real) == _canonical(shadow):
+            return True, "结果完全一致"
+        user = (
+            f"## 任务\n{task}\n\n## 结果 A（实际交付给用户的）\n{json.dumps(truncate(real, 3000), ensure_ascii=False, default=str)}"
+            f"\n\n## 结果 B（候选脚本产出的）\n{json.dumps(truncate(shadow, 3000), ensure_ascii=False, default=str)}"
+        )
+        try:
+            out = await complete_json(self.llms.fast, JUDGE_SYSTEM, user, purpose="shadow_judge")
+        except ValueError as e:
+            return False, f"比对失败: {e}"
+        return bool(out.get("same")), str(out.get("reason", ""))
+
+    def _record_shadow(self, skill: Skill, run: Run, agree: bool, reason: str) -> dict[str, Any]:
+        st = skill.shadow
+        assert st is not None
+        st.log = (st.log + [ShadowRecord(run_id=run.id, agree=agree, reason=reason[:300])])[-20:]
+        if agree:
+            st.passes += 1
+        else:
+            st.failures += 1
+        base = {"skill_id": skill.id, "version": st.version, "passes": st.passes, "failures": st.failures, "reason": reason}
+        if st.failures > self.s.shadow_max_failures:
+            self.store.reject_shadow(skill.id, f"影子运行未通过：{reason}")
+            return {**base, "status": "shadow_rejected"}
+        if st.passes >= self.s.shadow_min_runs:
+            self.store.promote(skill.id)
+            return {**base, "status": "promoted"}
+        self.store.save_shadow(skill)
+        return {**base, "status": "shadow_pass" if agree else "shadow_fail"}
 
     def _distill_prompt(self, cluster: list[Run]) -> str:
         parts = []

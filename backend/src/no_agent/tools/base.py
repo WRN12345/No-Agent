@@ -28,6 +28,10 @@ class ToolError(Exception):
     """工具调用失败"""
 
 
+class PermissionDenied(ToolError):
+    """技能调用了未声明的工具 / 访问了未声明的域名"""
+
+
 class UserAbort(Exception):
     """用户拒绝确认 / 取消输入：本次运行终止，不算脚本失败，不触发接管与修补"""
 
@@ -48,6 +52,8 @@ class Tool:
     confirm_message: Callable[[dict[str, Any]], str] | None = None
     # 交互式工具（需要等用户输入）
     interactive: bool = False
+    # 哪个参数是要访问的 URL（用于技能的域名权限检查）
+    url_arg: str | None = None
 
     def has_side_effect(self, args: dict[str, Any]) -> bool:
         return self.side_effect(args) if callable(self.side_effect) else bool(self.side_effect)
@@ -83,6 +89,7 @@ def tool(
     confirm: bool | Callable[[dict[str, Any]], bool] = False,
     confirm_message: Callable[[dict[str, Any]], str] | None = None,
     interactive: bool = False,
+    url_arg: str | None = None,
 ) -> Callable[[Callable[..., Any]], Tool]:
     """把函数声明为工具"""
 
@@ -96,6 +103,7 @@ def tool(
             confirm=confirm,
             confirm_message=confirm_message,
             interactive=interactive,
+            url_arg=url_arg,
         )
 
     return deco
@@ -130,6 +138,30 @@ class ToolRegistry:
             flags = [x for x, on in (("需用户确认", bool(t.confirm)), ("有副作用", bool(t.side_effect))) if on]
             lines.append(f"- {t.name}({args}): {t.description}" + (f"【{'，'.join(flags)}】" if flags else ""))
         return "\n".join(lines)
+
+
+ALWAYS_ALLOWED = {"ask_user"}  # 不需要声明的工具
+
+
+def host_of(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def domain_allowed(host: str, domains: list[str]) -> bool:
+    """example.com 匹配自身和所有子域名；*.example.com 只匹配子域名"""
+    for d in domains:
+        d = d.lower().strip()
+        if d.startswith("*."):
+            if host.endswith(d[1:]):
+                return True
+        elif host == d or host.endswith("." + d):
+            return True
+    return False
 
 
 def to_jsonable(obj: Any) -> Any:
@@ -210,11 +242,27 @@ class Toolbox:
     calls: list[ToolCallRecord] = field(default_factory=list)
     wait_seconds: float = 0.0  # 累计等待用户的时间
     waiting_since: float | None = None
+    # 当前生效的技能权限（None = 不限制；执行技能脚本时设置，AI 接管前清除）
+    allowed_tools: set[str] | None = None
+    allowed_domains: list[str] | None = None
+
+    def restrict(self, tools: list[str] | None, domains: list[str] | None) -> None:
+        self.allowed_tools = set(tools) | ALWAYS_ALLOWED if tools else None
+        self.allowed_domains = list(domains) if domains else None
+
+    def check_permission(self, t: Tool, args: dict[str, Any]) -> None:
+        if self.allowed_tools is not None and t.name not in self.allowed_tools:
+            raise PermissionDenied(f"技能未声明使用工具 {t.name}（已声明: {', '.join(sorted(self.allowed_tools))}）")
+        if self.allowed_domains is not None and t.url_arg and args.get(t.url_arg):
+            host = host_of(str(args[t.url_arg]))
+            if not domain_allowed(host, self.allowed_domains):
+                raise PermissionDenied(f"技能未声明访问域名 {host or args[t.url_arg]}（已声明: {', '.join(self.allowed_domains)}）")
 
     async def call(self, name: str, args: dict[str, Any], step: str | None = None) -> Any:
         t = self.registry.get(name)
         if t is None:
             raise ToolError(f"未知工具: {name}（可用: {', '.join(self.registry.names())}）")
+        self.check_permission(t, args)
         if t.needs_confirm(args) and not self.auto_confirm:
             await self._confirm(t, args)
         return await self._invoke(t, args, step)
@@ -299,6 +347,7 @@ class ReplayToolbox(Toolbox):
         t = self.registry.get(name)
         if t is None:
             raise ToolError(f"未知工具: {name}")
+        self.check_permission(t, args)
         fx = self._fixtures.get(args_key(name, to_jsonable(args)))
         if t.interactive:
             queue = self._answers.get(name, [])

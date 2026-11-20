@@ -48,6 +48,9 @@ SCRIPT_API_DOC = '''
 - 由若干 `@step` 装饰的 `async def 步骤名(ctx)` 组成，按定义顺序依次执行
 - 任一步骤 `return` 非 None 的值即成为（当前的）最终结果，最后一个非 None 的返回值为准
 - 可选定义 `def verify(ctx, result)`：返回 True 表示结果正确；返回字符串表示失败原因。强烈建议总是写
+- 可选定义 `async def guard(ctx)`：在所有步骤之前运行的前置检查，确认环境符合脚本的假设（页面结构、数据格式等）。
+  返回 True 表示可以执行；返回字符串表示不适用的原因（此时一个步骤都不会执行，直接交给 AI）。
+  guard 里只能调用只读工具。脚本中有不可撤销的步骤时，强烈建议写 guard
 - `step` 和 `ctx` 由运行时注入，无需 import
 - 只能 import：json, re, math, datetime, time, collections, itertools, html, urllib, base64, hashlib, csv, io, difflib 等标准库纯计算模块
 - 禁止 open/eval/exec/getattr、禁止访问以下划线开头的属性、禁止模块顶层执行逻辑（顶层只允许 import、常量、函数定义）
@@ -115,6 +118,7 @@ class StepDef:
 class LoadedScript:
     steps: list[StepDef] = field(default_factory=list)
     verify: Callable[..., Any] | None = None
+    guard: Callable[..., Any] | None = None
 
 
 def _is_step_decorator(d: ast.expr) -> bool:
@@ -201,9 +205,28 @@ def load_script(source: str) -> LoadedScript:
         exec(compile(source, SCRIPT_FILENAME, "exec"), namespace)  # noqa: S102 - 已经过 AST 校验
     except Exception as e:  # noqa: BLE001
         raise ScriptError(f"加载失败: {type(e).__name__}: {e}") from e
-    verify = namespace.get("verify")
+    verify, guard = namespace.get("verify"), namespace.get("guard")
     loaded.verify = verify if callable(verify) else None
+    loaded.guard = guard if callable(guard) else None
     return loaded
+
+
+def script_tools(source: str) -> set[str]:
+    """静态找出脚本中 ctx.tool("名字", ...) 调用的工具（用于权限检查与自动生成权限声明）"""
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "tool"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            names.add(node.args[0].value)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("ask", "confirm"):
+            names.add("ask_user")
+    return names
 
 
 # ── 按函数修补 ──

@@ -69,6 +69,9 @@ class SkillSummary(BaseModel):
     kind: str  # flow：带流程脚本 | guide：纯 SKILL.md 指南
     layer: str  # local：本项目技能库 | shared：只读共享库
     active_version: int
+    shadow_version: int | None = None  # 影子运行中的候选版本
+    shadow_passes: int = 0
+    shadow_failures: int = 0
     versions: int
     tests: int
     runs: int

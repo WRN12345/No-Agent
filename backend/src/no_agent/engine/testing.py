@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from no_agent.llm import BaseLLM
-from no_agent.skills.models import TestCase
+from no_agent.skills.models import Permissions, TestCase
 from no_agent.skills.runtime import execute_script
 from no_agent.tools.base import ReplayToolbox, ToolRegistry
 
@@ -44,12 +44,15 @@ async def run_tests(
     llm: BaseLLM,
     step_timeout: float = 60.0,
     concurrency: int = 4,
+    permissions: Permissions | None = None,
 ) -> TestReport:
     sem = asyncio.Semaphore(concurrency)
 
     async def one(case: TestCase):
         async with sem:
             toolbox = ReplayToolbox(registry, case.fixtures)
+            if permissions is not None:
+                toolbox.restrict(permissions.tools, permissions.domains)
             return case, await execute_script(
                 source, task=case.task, params=case.params, toolbox=toolbox, llm=llm, step_timeout=step_timeout
             )

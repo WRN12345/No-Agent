@@ -71,7 +71,9 @@ class AgentConfig(BaseModel):
     distill_min_traces: int = 2  # 积累多少条相似的成功轨迹后提炼新技能
     distill_similarity: float = 0.45
     patch_max_attempts: int = 2
-    promote_min_pass_rate: float = 0.8  # 新版本测试通过率达到此值才自动上线
+    promote_min_pass_rate: float = 0.8  # 新版本回归测试通过率达到此值，才进入影子运行
+    shadow_min_runs: int = 3  # 影子运行与真实结果一致多少次后自动转正；0 = 测试通过即上线（不做影子运行）
+    shadow_max_failures: int = 1  # 影子运行失败 / 不一致超过此次数就淘汰候选版本
     max_test_cases: int = 10
     retire_window: int = 10
     retire_min_success_rate: float = 0.3

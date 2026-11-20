@@ -17,6 +17,9 @@ from no_agent.skills.script import SCRIPT_FILENAME, ScriptError, load_script
 from no_agent.tools.base import Toolbox, ToolError, UserAbort, to_jsonable, truncate
 
 
+GUARD_STEP = "<guard>"
+
+
 class StepFailure(Exception):
     """脚本主动判定失败（ctx.fail）"""
 
@@ -35,6 +38,10 @@ class StepContext:
         self._step: str | None = None
 
     async def tool(self, name: str, **args: Any) -> Any:
+        if self._step == GUARD_STEP:
+            t = self._toolbox.registry.get(name)
+            if t is not None and (t.has_side_effect(args) or t.needs_confirm(args) or t.interactive):
+                raise StepFailure(f"guard 中只能调用只读工具，不能调用 {name}")
         return await self._toolbox.call(name, args, step=self._step)
 
     async def llm(self, instruction: str, input: Any = None, *, json: bool = False) -> Any:  # noqa: A002
@@ -82,6 +89,7 @@ class ExecutionResult:
     state: dict[str, Any] = field(default_factory=dict)
     logs: list[str] = field(default_factory=list)
     aborted: bool = False  # 用户取消（不是脚本的错）
+    guard_rejected: bool = False  # 前置检查判定"不适用"，一个步骤都没执行
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -91,6 +99,7 @@ class ExecutionResult:
             "steps": [s.__dict__ for s in self.steps],
             "logs": self.logs[-20:],
             "aborted": self.aborted,
+            "guard_rejected": self.guard_rejected,
         }
 
 
@@ -103,6 +112,11 @@ def _format_exc(e: BaseException) -> str:
     frames = [f for f in traceback.extract_tb(e.__traceback__) if f.filename == SCRIPT_FILENAME]
     where = f"（脚本第 {frames[-1].lineno} 行）" if frames else ""
     return f"{type(e).__name__}: {e}{where}"
+
+
+async def _as_coro(fn: Any, ctx: Any) -> Any:
+    v = fn(ctx)
+    return await v if inspect.isawaitable(v) else v
 
 
 async def _run_step(coro: Any, toolbox: Toolbox, timeout: float) -> Any:
@@ -147,6 +161,25 @@ async def execute_script(
         res.state = {k: truncate(to_jsonable(v), 1500) for k, v in ctx.state.items()}
         res.logs = ctx.logs
         return res
+
+    if loaded.guard is not None:
+        ctx._step = GUARD_STEP
+        try:
+            g = await _run_step(_as_coro(loaded.guard, ctx), toolbox, step_timeout)
+        except UserAbort as e:
+            res.aborted = True
+            return finish(False, GUARD_STEP, f"用户取消: {e}")
+        except asyncio.TimeoutError:
+            g = f"前置检查超时（{step_timeout}s）"
+        except StepFailure as e:
+            g = str(e)
+        except ToolError as e:
+            g = f"工具调用失败: {e}"
+        except Exception as e:  # noqa: BLE001
+            g = f"前置检查出错: {_format_exc(e)}"
+        if g is not True and g is not None:
+            res.guard_rejected = True
+            return finish(False, GUARD_STEP, f"前置检查未通过: {g if isinstance(g, str) else '返回 False'}")
 
     for s in loaded.steps:
         ctx._step = s.name
