@@ -43,11 +43,38 @@ class BrowserConfig(BaseModel):
     headless: bool = False  # 默认显示浏览器窗口，方便看到 AI 在做什么
     slow_mo: int = 0  # 每个操作放慢的毫秒数（调试用）
     action_timeout: float = 10.0  # 单个页面操作的超时（秒）
+    profile_dir: str | None = None  # 浏览器资料目录（保存登录状态等）；None 每次使用干净的临时目录
+
+    # browser-use（需要 pip install "No-Agent[browser-use]"）：提供 browser_agent 工具，
+    # 把开放式的网页子任务（登录、搜索、多页导航）交给 browser-use 在同一个浏览器里自主完成
+    browser_use: bool = False
+    browser_use_model: str | None = None  # 默认使用 strong 模型
+    browser_use_max_steps: int = 25
+    browser_use_confirm: bool = True  # 交给 browser-use 前请求确认（它的点击不经过本框架的提交确认）
+
+
+class McpServerConfig(BaseModel):
+    """
+    要接入的外部 MCP 服务（作为客户端）。它的工具会以 "<name>__<工具名>" 注册为本地工具。
+    二选一：command（本地进程，stdio）或 url（Streamable HTTP）
+    """
+
+    name: str
+    command: str | None = None
+    args: list[str] = []
+    env: dict[str, str] | None = None
+    cwd: str | None = None
+    url: str | None = None
+    headers: dict[str, str] | None = None
+    include: list[str] | None = None  # 只接入这些工具；None = 全部
+    # MCP 工具的 readOnlyHint / destructiveHint 映射为本框架的 side_effect / confirm
+    confirm_destructive: bool = True  # destructiveHint=true 的工具执行前请求用户确认
 
 
 class AgentConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
+    mcp_servers: list[McpServerConfig] = []
 
     # ── 存储位置（见 storage/home.py 的解析规则）──
     home: Path | None = None  # 数据根目录；为空时：环境变量 NO_AGENT_HOME > 向上查找 .no-agent/ > ./.no-agent

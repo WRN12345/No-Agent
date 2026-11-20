@@ -148,14 +148,21 @@ def _truthy(v: Any) -> bool:
 
 
 class BrowserSession:
-    """懒启动的浏览器会话，整个 Agent 共用一个页面"""
+    """
+    懒启动的浏览器会话，整个 Agent 共用一个浏览器上下文。
+    - 使用持久化上下文：profile_dir 指定时保存登录状态；否则用临时目录（每次都是干净的浏览器）
+    - 开启 browser-use 时打开本地 CDP 端口，让 browser-use 接入同一个浏览器，
+      它探索完之后，确定性工具可以在同一个页面上继续操作
+    """
 
     def __init__(self, cfg: BrowserConfig) -> None:
         self.cfg = cfg
         self._pw: Any = None
-        self._browser: Any = None
+        self._context: Any = None
         self._page: Any = None
         self._lock: asyncio.Lock | None = None
+        self._tmp_profile: str | None = None
+        self.cdp_url: str | None = None
 
     async def page(self) -> Any:
         if self._lock is None:
@@ -169,37 +176,70 @@ class BrowserSession:
                 raise ToolError('浏览器工具需要额外依赖：pip install "No-Agent[browser]"') from e
             if self._pw is None:
                 self._pw = await async_playwright().start()
-            if self._browser is None or not self._browser.is_connected():
-                self._browser = await self._launch()
-            context = await self._browser.new_context()
-            context.set_default_timeout(self.cfg.action_timeout * 1000)
-            self._page = await context.new_page()
+            if self._context is None:
+                self._context = await self._launch()
+                self._context.set_default_timeout(self.cfg.action_timeout * 1000)
+            pages = [pg for pg in self._context.pages if not pg.is_closed()]
+            self._page = pages[-1] if pages else await self._context.new_page()
             return self._page
 
+    async def adopt_latest_page(self) -> Any:
+        """切换到最近打开的标签页（browser-use 可能新开了标签页）"""
+        if self._context is not None:
+            pages = [pg for pg in self._context.pages if not pg.is_closed()]
+            if pages:
+                self._page = pages[-1]
+                await self._page.bring_to_front()
+        return await self.page()
+
     async def _launch(self) -> Any:
-        kw = {"headless": self.cfg.headless, "slow_mo": self.cfg.slow_mo}
+        import tempfile
+
+        profile = self.cfg.profile_dir
+        if not profile:
+            self._tmp_profile = profile = tempfile.mkdtemp(prefix="no-agent-browser-")
+        kw: dict[str, Any] = {"headless": self.cfg.headless, "slow_mo": self.cfg.slow_mo}
+        if self.cfg.browser_use:
+            port = _free_port()
+            kw["args"] = [f"--remote-debugging-port={port}", "--remote-debugging-address=127.0.0.1"]
+            self.cdp_url = f"http://127.0.0.1:{port}"
+        launch = self._pw.chromium.launch_persistent_context
         try:
-            return await self._pw.chromium.launch(channel=self.cfg.channel, **kw) if self.cfg.channel else await self._pw.chromium.launch(**kw)
+            return await launch(profile, channel=self.cfg.channel, **kw) if self.cfg.channel else await launch(profile, **kw)
         except Exception as e:  # noqa: BLE001
             if not self.cfg.channel:
                 raise ToolError(f"无法启动浏览器: {e}（可运行 `playwright install chromium`）") from e
             logger.warning("无法启动本机 %s（%s），改用 Playwright 自带 Chromium", self.cfg.channel, e)
             try:
-                return await self._pw.chromium.launch(**kw)
+                return await launch(profile, **kw)
             except Exception as e2:  # noqa: BLE001
                 raise ToolError(f"无法启动浏览器: {e2}（请安装 Chrome，或运行 `playwright install chromium`）") from e2
 
     async def close(self) -> None:
         try:
-            if self._browser is not None:
-                await self._browser.close()
+            if self._context is not None:
+                await self._context.close()
             if self._pw is not None:
                 await self._pw.stop()
         except Exception:  # noqa: BLE001
             logger.debug("关闭浏览器出错", exc_info=True)
         finally:
-            self._pw = self._browser = self._page = None
+            self._pw = self._context = self._page = None
             self._lock = None
+            self.cdp_url = None
+            if self._tmp_profile:
+                import shutil
+
+                shutil.rmtree(self._tmp_profile, ignore_errors=True)
+                self._tmp_profile = None
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 async def _page_info(page: Any) -> dict[str, Any]:

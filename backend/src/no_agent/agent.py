@@ -64,6 +64,8 @@ class Agent:
         self._home: Path | None = None
         self.asker: Asker | None = default_asker() if asker is _DEFAULT else asker
         self.browser = None
+        self._mcp_toolsets: list[Any] = []
+        self._mcp_started = False
 
         # ── 存储：只有用到默认实现时才创建 home 目录 ──
         # 技能层（优先级从低到高）：框架内置 → extra_skill_dirs → 本地可写层
@@ -87,6 +89,10 @@ class Agent:
             self.browser = BrowserSession(cfg.browser)
             for t in make_browser_tools(self.browser):
                 self.registry.register(t)
+            if cfg.browser.browser_use:
+                from no_agent.integrations.browser_use import make_browser_use_tool
+
+                self.registry.register(make_browser_use_tool(self.browser, cfg))
         for t in tools or []:
             self.registry.register(t)
 
@@ -148,9 +154,30 @@ class Agent:
 
     # ── 生命周期 ──
 
+    def set_asker(self, asker: Asker | None) -> None:
+        """更换提问 / 确认方式（例如作为 MCP 服务运行时，改为向 MCP 客户端发起 elicitation）"""
+        self.asker = asker
+        self.engine.asker = asker
+        self.registry.register(make_ask_tool(asker))
+
     async def start(self) -> None:
-        """启动后台进化器（run() 会自动调用）"""
+        """启动后台进化器，连接配置的 MCP 服务（幂等；run() 会自动调用）"""
         self.evolver.start()
+        if self.config.mcp_servers and not self._mcp_started:
+            from no_agent.integrations.mcp_client import McpToolset
+
+            self._mcp_started = True
+            for cfg in self.config.mcp_servers:
+                toolset = McpToolset(cfg)
+                try:
+                    tools = await toolset.connect()
+                except Exception:
+                    logger.exception("连接 MCP 服务 %s 失败，跳过", cfg.name)
+                    continue
+                self._mcp_toolsets.append(toolset)
+                for t in tools:
+                    self.registry.register(t)
+                logger.info("已接入 MCP 服务 %s：%d 个工具", cfg.name, len(tools))
 
     async def stop(self, *, wait: bool = True) -> None:
         """停止后台进化器；wait=True 时先等待排队中的进化任务完成"""
@@ -159,6 +186,10 @@ class Agent:
         await self.evolver.stop()
         if self.browser is not None:
             await self.browser.close()
+        for toolset in reversed(self._mcp_toolsets):
+            await toolset.close()
+        self._mcp_toolsets.clear()
+        self._mcp_started = False
 
     async def wait_idle(self) -> None:
         """等待所有进化任务完成"""
@@ -187,7 +218,7 @@ class Agent:
           freeform 强制 AI 自由执行
           skill    指定 skill_id（可同时给 params 跳过参数抽取）
         """
-        self.evolver.start()
+        await self.start()
         return await self.engine.run(task, mode=mode, skill_id=skill_id, params=params)
 
     def run_sync(self, task: str, **kwargs: Any) -> Run:

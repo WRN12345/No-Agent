@@ -18,6 +18,8 @@
 pip install No-Agent              # 核心库
 pip install "No-Agent[server]"    # 附带 HTTP 服务（FastAPI）
 pip install "No-Agent[browser]"   # 附带浏览器工具（Playwright，默认使用本机 Chrome）
+pip install "No-Agent[mcp]"       # MCP 服务端 / 客户端
+pip install "No-Agent[browser-use]"  # browser-use 浏览器 Agent（开放式网页探索）
 ```
 
 本仓库开发：`cd backend && pip install -e ".[dev]" && python -m pytest`（离线跑通完整进化闭环，使用假 LLM）。
@@ -114,6 +116,12 @@ open_page → snapshot（一次读出全部字段：标签/类型/必填/选项/
 
 **浏览器工具**：`browser_open` / `browser_snapshot` / `browser_fill` / `browser_read` / `browser_click` / `browser_submit` / `browser_text`。提交按钮只能通过 `browser_submit`，`browser_click` 会拒绝点击提交按钮。
 
+**browser-use（可选）**：`BrowserConfig(browser_use=True)` 后多一个 `browser_agent` 工具。它把开放式的网页子任务（登录、搜索、翻页、在菜单里找页面）交给 browser-use，在**同一个浏览器**里通过 CDP 完成；完成后 `browser_snapshot` / `browser_fill` 等确定性工具在它停下的页面上接着操作。
+
+- 分工：browser-use 负责"把页面带到正确位置"（每步都要大模型推理，贵、不确定）；可重复的部分交给确定性工具，才能沉淀成省 token 的技能
+- 安全：browser-use 的点击不经过本框架的提交确认，所以**调用 browser_agent 本身默认需要用户确认**，并要求它不要提交、付款、删除
+- 已在 browser-use 1.0.6 上验证接入与断开（断开后浏览器和页面保持可用）
+
 **提问与确认**：
 
 - 脚本里用 `await ctx.ask([...])` / `await ctx.confirm("...")`，AI 自由执行时用 `ask_user` 工具，都要求**一次问完**
@@ -122,6 +130,47 @@ open_page → snapshot（一次读出全部字段：标签/类型/必填/选项/
 - 等待用户输入的时间不计入步骤超时
 - 问答会录进轨迹，提炼和测试回放时直接用录制的回答，不会再弹问题，也不会真的提交
 - 提问方式可替换：`Agent(asker=...)`，实现 `ask()` / `confirm()` 即可（默认终端；非交互环境为 None，此时需确认的操作一律拒绝）。`ScriptedAsker` 用于测试和无人值守的批处理
+
+## MCP：被其他 Agent 调用，也调用别人的工具
+
+**作为 MCP 服务**（Claude Desktop / Claude Code / Cursor 等都能接入）：
+
+```json
+{"mcpServers": {"no-agent": {"command": "no-agent", "args": ["mcp"], "env": {"NO_AGENT_HOME": "/path/to/project/.no-agent"}}}}
+```
+
+| 暴露内容 | 说明 |
+|---|---|
+| `run_task(task)` | 执行任意任务（自动选择 技能脚本 / AI 接管 / AI 自由执行） |
+| `list_skills()` | 列出技能 |
+| `skill_<id>(...)` | 每个流程型技能一个工具，参数就是技能的 `params_schema`（显式调用，零匹配开销）；按技能权限标注 `readOnlyHint` / `destructiveHint` |
+| 资源 `skill://<id>/SKILL.md` | 每个技能的 SKILL.md，客户端可以直接读来当指南 |
+
+技能里的 `ctx.ask()` 和需要确认的操作，会变成 **MCP elicitation**，由客户端弹表单问用户。客户端拒绝或不支持 elicitation 时，运行以 `aborted` 结束，绝不会跳过确认。
+
+代码里使用：`create_mcp_server(agent)` / `await serve_stdio(agent)`（[integrations/mcp_server.py](src/no_agent/integrations/mcp_server.py)）。
+
+**作为 MCP 客户端**：外部 MCP 服务的工具注册为本地工具（`<name>__<工具名>`），和内置工具一样被录制、回放、提炼进技能：
+
+```python
+from no_agent.config import McpServerConfig
+
+AgentConfig(mcp_servers=[
+    McpServerConfig(name="github", command="npx", args=["-y", "@modelcontextprotocol/server-github"]),
+    McpServerConfig(name="crm", url="https://crm.example.com/mcp", headers={"Authorization": "Bearer ..."}),
+])
+```
+
+MCP 工具注解的映射：`readOnlyHint=true` → 无副作用；其他 → 有副作用（回放测试时不执行）；`destructiveHint=true` → 执行前请求确认。
+
+## 命令行
+
+```bash
+no-agent mcp                 # 启动 MCP 服务（stdio）
+no-agent serve --port 8000   # 启动 HTTP 服务
+no-agent skills              # 列出技能（含候选版本、成功率）
+no-agent install <目录>      # 安装技能
+```
 
 ## 数据存在哪
 
@@ -205,6 +254,8 @@ docker compose up                  # 见 ../docker-compose.yml，数据在 /data
 | `src/no_agent/interact.py` | 提问与确认：`Asker` 协议、终端实现、`ask_user` 工具 |
 | `src/no_agent/builtin_skills/` | 随框架分发的只读技能（`fill-form`） |
 | `src/no_agent/server/` | 可选 HTTP 服务 |
+| `src/no_agent/integrations/` | MCP 服务端 / 客户端、browser-use |
+| `src/no_agent/cli.py` | 命令行 `no-agent` |
 
 ## 关键设计
 
@@ -227,7 +278,9 @@ docker compose up                  # 见 ../docker-compose.yml，数据在 /data
 - **单进程**：进化器是进程内 asyncio 队列，文件技能库用进程内锁。多进程 / 多实例部署需要外部队列和带锁的存储（可通过自定义 `SkillStore` 实现）。
 - **命名空间（多租户）**：尚未支持，计划后续加入，届时通过 `schema_version` 迁移已有数据。
 - **共享技能的上游更新**：技能一旦复制到本地，本地版本优先，不会自动合并上游更新。
-- **浏览器**：每个 Agent 共用一个页面，暂不支持多标签页、文件上传、验证码；`run_sync` 每次调用结束都会关闭浏览器。
+- **浏览器**：每个 Agent 共用一个浏览器上下文，暂不支持文件上传、验证码；`run_sync` 每次调用结束都会关闭浏览器。
+- **browser_agent 的轨迹是黑盒**：browser-use 内部的每一步不会录进轨迹，所以经过它的部分无法被提炼成确定性脚本（只能提炼它前后的确定性步骤）。
+- **MCP 服务**：目前只提供 stdio 传输；HTTP 传输（Streamable HTTP）待做。技能列表变化时不会主动通知客户端，客户端重新列出工具即可看到。
 
 ## 路线图（方案二：分层编译）
 
@@ -235,5 +288,5 @@ docker compose up                  # 见 ../docker-compose.yml，数据在 /data
 |---|---|---|
 | 1 | SKILL.md 格式适配、指南型技能、安装、显式调用 | ✅ 完成 |
 | 2 | 前置检查（guard）、影子运行后自动转正、权限强制检查 | ✅ 完成 |
-| 3 | MCP 服务端 / 客户端、接入 browser-use 作为 AI 浏览层 | 待做 |
+| 3 | MCP 服务端 / 客户端、接入 browser-use 作为 AI 浏览层、命令行 | ✅ 完成 |
 | 4 | L1 原子技能层、按热度升级（指南 → 脚本）、多候选提炼、git 技能仓库 + 签名 | 待做 |
