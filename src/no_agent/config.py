@@ -115,8 +115,10 @@ class AgentConfig(BaseModel):
     # ── 脚本隔离（见 docs/design/script-isolation.html）──
     # process：在一次性子进程中执行（默认）。逃逸后拿不到密钥和宿主对象、绕不过权限，死循环可被终止；
     #          但不阻止读写本机文件和直接联网
+    # sandbox：process + 操作系统级约束（Linux：Landlock 只读文件系统 + seccomp 禁止联网 / 执行程序 / 创建进程）。
+    #          内核不支持时拒绝启动，不降级。untrusted_shared="shadow" 的影子运行只在这一档下执行
     # inprocess：在本进程内执行，只有 Python 层的白名单（仅用于测试或完全信任所有脚本的场景）
-    script_isolation: Literal["process", "inprocess"] = "process"
+    script_isolation: Literal["process", "sandbox", "inprocess"] = "process"
     worker_pool_size: int = 2  # 预热的空 worker 数
     worker_memory_mb: int = 512  # 每个 worker 的内存上限；0 = 不限制
     worker_cpu_seconds: int = 300  # 每个 worker 的 CPU 时间兜底上限（宿主崩溃时也能终止失控脚本）；0 = 不限制

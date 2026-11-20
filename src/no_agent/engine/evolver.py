@@ -561,6 +561,8 @@ class Evolver:
         if not run.success:
             return {"status": "skipped", "reason": "真实运行未成功"}
         shadows = [s for s in self.store.list(include_retired=True) if s.status == "shadow" and s.shadow]
+        if not getattr(runner_for(self.s), "sandboxed", False):  # 不可信的共享技能只能在 sandbox 档下执行
+            shadows = [s for s in shadows if s.id not in getattr(self.store, "untrusted", ())]
         cands = [s for s, _ in await self.matcher.candidates(run.task, shadows)]
         m = await self.matcher.match(run.task, only=cands) if cands else None
         if m is None or m.skill.shadow is None:
@@ -571,6 +573,9 @@ class Evolver:
         return await self._judge_and_record(m.skill, run, res)
 
     async def _run_shadow(self, skill: Skill, version: int, run: Run, params: dict[str, Any]):
+        runner = runner_for(self.s)
+        if skill.id in getattr(self.store, "untrusted", ()) and not getattr(runner, "sandboxed", False):
+            raise RuntimeError(f"拒绝在 sandbox 档之外执行不可信的共享技能 {skill.id}")
         toolbox = ReplayToolbox(self.registry, run.trace.get("fixtures", []), timeout=self.s.tool_timeout)
         toolbox.restrict(skill.permissions.tools, skill.permissions.domains)
         return await execute_script(
@@ -582,7 +587,7 @@ class Evolver:
             step_timeout=self.s.step_timeout,
             skills=self._caller(stack=(skill.id,)),
             skill_allowlist=skill.permissions.skills,
-            runner=runner_for(self.s),
+            runner=runner,
             budget=Budget.from_config(self.s),
         )
 

@@ -1,13 +1,16 @@
 """
 脚本 worker 子进程入口（由 ProcessRunner 启动，一个进程只服务一次脚本执行）
 
-    python -I -X utf8 _worker.py <内存上限 MB> <CPU 秒数上限>
+    python -I -X utf8 _worker.py <内存上限 MB> <CPU 秒数上限> [process|sandbox]
+
+sandbox：预热完成后、加载任何脚本之前进入操作系统级约束（_confine.py，仅 Linux）。
+进入失败时回报 failed{kind: sandbox} 并退出，绝不在没有约束的情况下继续。
 
 只依赖标准库：按文件路径加载同目录的 sandbox.py，不 import no_agent 包（避免把框架、配置、密钥带进来）。
 协议：stdin / stdout 上的帧（4 字节大端长度 + UTF-8 JSON）。脚本的 print 被重定向到 stderr，不会混进协议。
 
 宿主 → worker：load{source, task, params} | run{phase, name} | reply{id, ok, value | error}
-worker → 宿主：ready | loaded{steps} | failed{kind: load, message} | call{id, kind: tool|llm|skill, ...}
+worker → 宿主：ready{confinement} | failed{kind: sandbox, message} | loaded{steps} | failed{kind: load, message} | call{id, kind: tool|llm|skill, ...}
               | done{status, message, snapshot}
 
 本文件同时被宿主 import（复用帧读写函数），模块顶层不能有副作用。
@@ -120,11 +123,11 @@ def _load_module(name: str, path: Path) -> Any:
 
 
 class Worker:
-    def __init__(self, sb: Any, inp: BinaryIO, out: BinaryIO) -> None:
+    def __init__(self, sb: Any, inp: BinaryIO, out: BinaryIO, loop: asyncio.AbstractEventLoop) -> None:
         self.sb = sb
         self.inp = inp
         self.out = out
-        self.loop = asyncio.new_event_loop()
+        self.loop = loop
         self.loaded: Any = None
         self.ctx: Any = None
         self.next_id = 0
@@ -203,8 +206,18 @@ class Worker:
         return self._error_types[name](message)
 
 
+def _read_paths() -> list[str]:
+    """sandbox 档下允许只读访问的路径：Python 安装目录、sys.path、时区数据（ZoneInfo 会按需读取）"""
+    import zoneinfo
+
+    paths = [sys.prefix, sys.base_prefix, sys.exec_prefix, *[p for p in sys.path if p]]
+    paths += [*zoneinfo.TZPATH, "/etc/localtime", "/dev/urandom", "/dev/null"]
+    return paths
+
+
 def main() -> None:
     memory_mb, cpu_s = (int(a) for a in sys.argv[1:3])
+    sandboxed = len(sys.argv) > 3 and sys.argv[3] == "sandbox"
     _apply_limits(memory_mb, cpu_s)
     sb = _load_module("no_agent_worker_sandbox", Path(__file__).resolve().with_name("sandbox.py"))
     for m in sorted(sb.ALLOWED_IMPORTS | sb.ALLOWED_SUBMODULES):  # 预热：脚本里的 import 不再计入步骤耗时
@@ -216,9 +229,19 @@ def main() -> None:
     inp, out = sys.stdin.buffer, sys.stdout.buffer
     sys.stdout = sys.stderr  # 脚本的 print 写到 stderr，协议只走原始 stdout
     sys.stdin = open(os.devnull, encoding="utf-8")  # noqa: SIM115
-    write_frame(out, {"op": "ready"})
+    # 事件循环必须在进入 sandbox 之前创建：Linux 上它内部要建一对 socket 用于唤醒，之后 seccomp 会拒绝
+    loop = asyncio.new_event_loop()
+    confinement = None
+    if sandboxed:
+        try:
+            confine = _load_module("no_agent_worker_confine", Path(__file__).resolve().with_name("_confine.py"))
+            confinement = asdict(confine.enter(_read_paths()))
+        except Exception as e:  # noqa: BLE001 - 任何失败都拒绝启动
+            write_frame(out, {"op": "failed", "kind": "sandbox", "message": f"{type(e).__name__}: {e}"})
+            sys.exit(3)
+    write_frame(out, {"op": "ready", "confinement": confinement})
     try:
-        Worker(sb, inp, out).serve()
+        Worker(sb, inp, out, loop).serve()
     except ProtocolError as e:
         print(f"[worker] 协议错误: {e}", file=sys.stderr)
         sys.exit(2)

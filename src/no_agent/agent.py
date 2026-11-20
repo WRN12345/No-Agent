@@ -61,6 +61,8 @@ class Agent:
                非交互环境（服务、后台任务）为 None——此时需确认的操作会被拒绝（除非 auto_confirm）
         """
         self.config = cfg = config or AgentConfig()
+        if cfg.untrusted_shared == "shadow" and cfg.script_isolation != "sandbox":
+            logger.warning('untrusted_shared="shadow" 需要 script_isolation="sandbox"：当前档位下不可信共享技能的影子运行会被跳过')
         self._home: Path | None = None
         self.asker: Asker | None = default_asker() if asker is _DEFAULT else asker
         self.browser = None

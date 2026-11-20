@@ -13,6 +13,7 @@ Runner 只负责"在某处加载脚本、按指令执行单个阶段、交回快
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -194,4 +195,7 @@ def runner_for(cfg: AgentConfig) -> ScriptRunner:
         return IN_PROCESS
     from no_agent.skills.process import ProcessRunner, get_pool
 
-    return ProcessRunner(get_pool(cfg.worker_pool_size, cfg.worker_memory_mb, cfg.worker_cpu_seconds))
+    sandbox = cfg.script_isolation == "sandbox"
+    if sandbox and not sys.platform.startswith("linux"):
+        raise ValueError('script_isolation="sandbox" 目前只支持 Linux（Windows / macOS 请用 "process"，或在 Linux 容器中部署）')
+    return ProcessRunner(get_pool(cfg.worker_pool_size, cfg.worker_memory_mb, cfg.worker_cpu_seconds, sandbox))

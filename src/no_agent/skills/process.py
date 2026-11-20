@@ -119,14 +119,16 @@ class WorkerProcess:
     进程本身不属于任何事件循环，可以跨循环 / 线程放在池里。
     """
 
-    def __init__(self, memory_mb: int, cpu_s: int) -> None:
+    def __init__(self, memory_mb: int, cpu_s: int, sandbox: bool = False) -> None:
         self.tmp = tempfile.mkdtemp(prefix="No-Agent-worker-")
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0  # type: ignore[attr-defined]
+        mode = "sandbox" if sandbox else "process"
         try:
             self.proc = subprocess.Popen(
-                [sys.executable, "-I", "-X", "utf8", str(WORKER_PATH), str(memory_mb), str(cpu_s)],
+                [sys.executable, "-I", "-X", "utf8", str(WORKER_PATH), str(memory_mb), str(cpu_s), mode],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 cwd=self.tmp, env=_minimal_env(self.tmp), creationflags=flags, close_fds=True,
+                start_new_session=os.name == "posix",  # 独立的进程组：kill(0, …) 打不到宿主
             )
         except OSError as e:
             shutil.rmtree(self.tmp, ignore_errors=True)
@@ -256,17 +258,18 @@ class WorkerProcess:
 
 
 class WorkerPool:
-    def __init__(self, size: int, memory_mb: int, cpu_s: int) -> None:
+    def __init__(self, size: int, memory_mb: int, cpu_s: int, sandbox: bool = False) -> None:
         self.size = size
         self.memory_mb = memory_mb
         self.cpu_s = cpu_s
+        self.sandbox = sandbox
         self._idle: deque[WorkerProcess] = deque()
         self._lock = threading.Lock()
         self._refilling = False
         self._closed = False
 
     def _spawn(self) -> WorkerProcess:
-        return WorkerProcess(self.memory_mb, self.cpu_s)
+        return WorkerProcess(self.memory_mb, self.cpu_s, self.sandbox)
 
     def acquire(self) -> WorkerProcess:
         """取一个空闲 worker（没有就现场启动），并在后台补满预热池。阻塞调用，请放在线程里"""
@@ -319,17 +322,17 @@ class WorkerPool:
             w.kill()
 
 
-_POOLS: dict[tuple[int, int, int], WorkerPool] = {}
+_POOLS: dict[tuple[int, int, int, bool], WorkerPool] = {}
 _POOLS_LOCK = threading.Lock()
 
 
-def get_pool(size: int, memory_mb: int, cpu_s: int) -> WorkerPool:
+def get_pool(size: int, memory_mb: int, cpu_s: int, sandbox: bool = False) -> WorkerPool:
     """同样配置共用一个池（多个 Agent 实例也一样）"""
-    key = (size, memory_mb, cpu_s)
+    key = (size, memory_mb, cpu_s, sandbox)
     with _POOLS_LOCK:
         pool = _POOLS.get(key)
         if pool is None or pool._closed:
-            pool = _POOLS[key] = WorkerPool(size, memory_mb, cpu_s)
+            pool = _POOLS[key] = WorkerPool(size, memory_mb, cpu_s, sandbox)
         return pool
 
 
@@ -438,6 +441,11 @@ class ProcessRunner:
     def __init__(self, pool: WorkerPool) -> None:
         self.pool = pool
 
+    @property
+    def sandboxed(self) -> bool:
+        """worker 是否处于操作系统级约束之下（sandbox 档）"""
+        return self.pool.sandbox
+
     async def open(self, source: str, *, task: str, params: dict[str, Any], bridge: Any) -> ProcessSession:
         validate_script(source)  # 先在宿主静态校验：不合法的脚本不必启动进程
         steps = step_meta(source)
@@ -458,12 +466,15 @@ class ProcessRunner:
             raise
         return ProcessSession(w, bridge, steps)
 
-    @staticmethod
-    async def _handshake(w: WorkerProcess, source: str, task: str, params: dict[str, Any], steps: list[StepMeta]) -> None:
+    async def _handshake(self, w: WorkerProcess, source: str, task: str, params: dict[str, Any], steps: list[StepMeta]) -> None:
         w.bind()
         msg = await w.recv()
+        if msg["op"] == "failed" and msg.get("kind") == "sandbox":
+            raise WorkerError(f"worker 无法进入 sandbox: {msg.get('message', '')}")
         if msg["op"] != "ready":
             raise WorkerError(f"意外的消息 {msg['op']}")
+        if self.sandboxed and not isinstance(msg.get("confinement"), dict):
+            raise WorkerError("worker 没有报告已进入 sandbox")
         await w.send({"op": "load", "source": source, "task": task, "params": to_jsonable(params)})
         msg = await w.recv()
         if msg["op"] == "failed":
