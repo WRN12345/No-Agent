@@ -28,6 +28,7 @@ from no_agent.storage.sql import Run
 from no_agent.skills.compose import SkillCaller
 from no_agent.skills.matcher import MatchResult, SkillMatcher
 from no_agent.skills.models import Skill, validate_params
+from no_agent.skills.runner import Budget, runner_for
 from no_agent.skills.runtime import ExecutionResult, execute_script
 from no_agent.skills.script import function_source
 from no_agent.tools.base import Toolbox, ToolRegistry, UserAbort
@@ -58,6 +59,7 @@ class EvolvingAgent:
         self.evolver = evolver
         self.s = settings
         self.asker = asker
+        self.runner = runner_for(settings)
 
     async def run(
         self,
@@ -98,7 +100,7 @@ class EvolvingAgent:
                         source, task=task, params=match.params, toolbox=toolbox, llm=self.llms.fast,
                         step_timeout=self.s.step_timeout,
                         skills=SkillCaller(self.store, self.llms.fast, step_timeout=self.s.step_timeout, stack=(match.skill.id,)),
-                        skill_allowlist=perms.skills,
+                        skill_allowlist=perms.skills, runner=self.runner, budget=Budget.from_config(self.s),
                     )
                 finally:
                     toolbox.restrict(None, None)  # AI 接管不受技能权限限制

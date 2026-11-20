@@ -59,7 +59,9 @@ class SkillCaller:
             raise SkillCallError(f"{skill_id} 是指南型技能，不能被脚本调用")
         return skill, self.store.script(skill_id)
 
-    async def call(self, skill_id: str, params: dict[str, Any], *, toolbox: Toolbox, task: str) -> Any:
+    async def call(
+        self, skill_id: str, params: dict[str, Any], *, toolbox: Toolbox, task: str, runner: Any = None, budget: Any = None
+    ) -> Any:
         from no_agent.skills.runtime import execute_script
 
         if skill_id in self.stack:
@@ -78,7 +80,7 @@ class SkillCaller:
         with toolbox.delegated(skill.permissions.tools, skill.permissions.domains):
             res = await execute_script(
                 source, task=task, params=params, toolbox=toolbox, llm=self.llm, step_timeout=self.step_timeout,
-                skills=child, skill_allowlist=skill.permissions.skills,
+                skills=child, skill_allowlist=skill.permissions.skills, runner=runner, budget=budget,
             )
         if res.aborted:
             raise UserAbort(res.error or "用户取消")

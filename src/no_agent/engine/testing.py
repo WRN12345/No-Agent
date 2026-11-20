@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from no_agent.llm import BaseLLM
 from no_agent.skills.models import Permissions, TestCase
@@ -46,6 +46,8 @@ async def run_tests(
     concurrency: int = 4,
     permissions: Permissions | None = None,
     skills: Any = None,
+    runner: Any = None,
+    budget_factory: Callable[[], Any] | None = None,
 ) -> TestReport:
     sem = asyncio.Semaphore(concurrency)
 
@@ -57,6 +59,7 @@ async def run_tests(
             return case, await execute_script(
                 source, task=case.task, params=case.params, toolbox=toolbox, llm=llm, step_timeout=step_timeout,
                 skills=skills, skill_allowlist=permissions.skills if permissions else None,
+                runner=runner, budget=budget_factory() if budget_factory else None,
             )
 
     report = TestReport(total=len(cases))

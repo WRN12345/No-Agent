@@ -158,6 +158,20 @@ no-agent sign skills/fill-form --key team.key --signer team
 
 子技能在自己声明的权限下运行；子技能没有声明的工具 / 域名不会因此放开，而是继承调用方的限制。
 
+## 脚本隔离
+
+技能脚本默认在一次性子进程中执行（`script_isolation="process"`）。工具、LLM、子技能调用和权限检查都留在主进程，子进程只能通过 JSON 消息请主进程代办，环境变量里也没有 API Key。
+
+| 配置 | 默认 | 说明 |
+|---|---|---|
+| `script_isolation` | `"process"` | `"inprocess"`：在本进程内执行，只有 Python 层的白名单，仅用于测试或完全信任所有脚本的场景 |
+| `worker_pool_size` | `2` | 预热的空子进程数 |
+| `worker_memory_mb` | `512` | 每个子进程的内存上限 |
+| `worker_cpu_seconds` | `300` | CPU 时间兜底上限，主进程崩溃时也能终止失控的脚本 |
+| `script_max_tool_calls` / `script_max_llm_calls` | `500` / `100` | 一次执行（含子技能）的调用次数上限 |
+
+这一档能保证：脚本即使逃逸了 Python 层的沙箱，也拿不到密钥、绕不过工具和域名权限；死循环会在步骤超时后被终止。它**不**阻止脚本读写当前用户能访问的文件，也不阻止直接联网。需要这一级隔离时，请在容器中部署。设计见 [docs/design/script-isolation.html](docs/design/script-isolation.html)。
+
 ## 浏览器与人机交互
 
 不走"截图 → 看图 → 移鼠标"的 computer use，而是读元素树、批量操作：

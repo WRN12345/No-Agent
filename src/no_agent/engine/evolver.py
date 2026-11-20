@@ -27,6 +27,7 @@ from no_agent.storage.sql import Run
 from no_agent.skills.matcher import SkillMatcher, lexical_similarity
 from no_agent.skills.models import Permissions, ShadowRecord, Skill, TestCase
 from no_agent.skills.compose import SkillCaller
+from no_agent.skills.runner import Budget, runner_for
 from no_agent.skills.runtime import execute_script
 from no_agent.skills.script import (
     SCRIPT_API_DOC,
@@ -218,6 +219,7 @@ class Evolver:
         return await run_tests(
             source, cases, registry=self.registry, llm=self.llms.fast, step_timeout=self.s.step_timeout,
             permissions=permissions, skills=self._caller(overlay),
+            runner=runner_for(self.s), budget_factory=lambda: Budget.from_config(self.s),
         )
 
     @property
@@ -580,6 +582,8 @@ class Evolver:
             step_timeout=self.s.step_timeout,
             skills=self._caller(stack=(skill.id,)),
             skill_allowlist=skill.permissions.skills,
+            runner=runner_for(self.s),
+            budget=Budget.from_config(self.s),
         )
 
     async def _judge_and_record(self, skill: Skill, run: Run, res) -> dict[str, Any]:

@@ -13,6 +13,7 @@ Runner 只负责"在某处加载脚本、按指令执行单个阶段、交回快
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 from no_agent.llm import BaseLLM, parse_json
@@ -35,7 +36,35 @@ from no_agent.skills.sandbox import (
 from no_agent.tools.base import Toolbox, ToolError, UserAbort
 
 if TYPE_CHECKING:
+    from no_agent.config import AgentConfig
     from no_agent.skills.compose import SkillCaller
+
+
+@dataclass
+class Budget:
+    """
+    一次执行（含它调用的所有子技能）的调用次数上限，防止脚本刷爆 LLM 费用或无限调用工具。
+    None 表示不限制。子技能共用调用方的同一个 Budget。
+    """
+
+    max_tool_calls: int | None = None
+    max_llm_calls: int | None = None
+    tool_calls: int = 0
+    llm_calls: int = 0
+
+    @classmethod
+    def from_config(cls, cfg: AgentConfig) -> Budget:
+        return cls(max_tool_calls=cfg.script_max_tool_calls, max_llm_calls=cfg.script_max_llm_calls)
+
+    def charge_tool(self) -> None:
+        self.tool_calls += 1
+        if self.max_tool_calls is not None and self.tool_calls > self.max_tool_calls:
+            raise StepFailure(f"超出单次执行的工具调用上限（{self.max_tool_calls} 次）")
+
+    def charge_llm(self) -> None:
+        self.llm_calls += 1
+        if self.max_llm_calls is not None and self.llm_calls > self.max_llm_calls:
+            raise StepFailure(f"超出单次执行的 ctx.llm 调用上限（{self.max_llm_calls} 次）")
 
 
 def _dumps(obj: Any) -> str:
@@ -58,8 +87,12 @@ class CtxBridge:
         task: str,
         skills: SkillCaller | None = None,
         skill_allowlist: list[str] | None = None,
+        runner: ScriptRunner | None = None,
+        budget: Budget | None = None,
     ) -> None:
         self.toolbox = toolbox
+        self.runner = runner  # 子技能沿用同一个 runner
+        self.budget = budget or Budget()  # 子技能共用同一个预算
         self.llm_client = llm
         self.task = task
         self.skills = skills  # None 表示当前环境不支持调用子技能
@@ -71,6 +104,7 @@ class CtxBridge:
             t = self.toolbox.registry.get(name)
             if t is None or t.has_side_effect(args) or t.needs_confirm(args) or t.interactive:
                 raise StepFailure(f"guard 中只能调用只读工具，不能调用 {name}")
+        self.budget.charge_tool()
         return await self.toolbox.call(name, args, step=self.step)
 
     async def llm(self, instruction: str, input: Any, json: bool) -> Any:  # noqa: A002
@@ -79,6 +113,7 @@ class CtxBridge:
             content += "\n\n输入:\n" + (input if isinstance(input, str) else _dumps(input))
         if json:
             content += "\n\n只输出一个 JSON 对象。"
+        self.budget.charge_llm()
         reply = await self.llm_client.complete([{"role": "user", "content": content}], purpose="script_llm")
         return parse_json(reply.content) if json else reply.content.strip()
 
@@ -92,7 +127,9 @@ class CtxBridge:
         if self.toolbox.tools_restricted and skill_id not in self.skill_allowlist:
             raise StepFailure(f"技能未声明调用子技能 {skill_id}")
         try:
-            return await self.skills.call(skill_id, params, toolbox=self.toolbox, task=self.task)
+            return await self.skills.call(
+                skill_id, params, toolbox=self.toolbox, task=self.task, runner=self.runner, budget=self.budget
+            )
         except SkillCallError as e:
             raise StepFailure(str(e)) from e
 
@@ -149,3 +186,12 @@ class InProcessRunner:
 
 
 IN_PROCESS = InProcessRunner()
+
+
+def runner_for(cfg: AgentConfig) -> ScriptRunner:
+    """按配置选择脚本执行位置"""
+    if cfg.script_isolation == "inprocess":
+        return IN_PROCESS
+    from no_agent.skills.process import ProcessRunner, get_pool
+
+    return ProcessRunner(get_pool(cfg.worker_pool_size, cfg.worker_memory_mb, cfg.worker_cpu_seconds))

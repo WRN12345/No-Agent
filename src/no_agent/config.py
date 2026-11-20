@@ -112,6 +112,17 @@ class AgentConfig(BaseModel):
     tool_timeout: float = 60.0
     auto_confirm: bool = False  # 需确认的操作（提交等）是否跳过确认直接执行；默认每次都问
 
+    # ── 脚本隔离（见 docs/design/script-isolation.html）──
+    # process：在一次性子进程中执行（默认）。逃逸后拿不到密钥和宿主对象、绕不过权限，死循环可被终止；
+    #          但不阻止读写本机文件和直接联网
+    # inprocess：在本进程内执行，只有 Python 层的白名单（仅用于测试或完全信任所有脚本的场景）
+    script_isolation: Literal["process", "inprocess"] = "process"
+    worker_pool_size: int = 2  # 预热的空 worker 数
+    worker_memory_mb: int = 512  # 每个 worker 的内存上限；0 = 不限制
+    worker_cpu_seconds: int = 300  # 每个 worker 的 CPU 时间兜底上限（宿主崩溃时也能终止失控脚本）；0 = 不限制
+    script_max_tool_calls: int | None = 500  # 一次执行（含子技能）最多调用多少次工具；None = 不限制
+    script_max_llm_calls: int | None = 100  # 一次执行（含子技能）最多调用多少次 ctx.llm；None = 不限制
+
     # ── 进化 ──
     distill_min_traces: int = 2  # 积累多少条相似的成功轨迹后提炼新技能
     distill_similarity: float = 0.45

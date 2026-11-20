@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable
 
 from no_agent.llm import BaseLLM
-from no_agent.skills.runner import IN_PROCESS, CtxBridge, ScriptRunner, ScriptSession
+from no_agent.skills.runner import IN_PROCESS, Budget, CtxBridge, ScriptRunner, ScriptSession
 from no_agent.skills.sandbox import GUARD_STEP, VERIFY_STEP, PhaseOutcome, ScriptError, StepFailure  # noqa: F401
 from no_agent.tools.base import Toolbox
 
@@ -82,14 +82,19 @@ async def execute_script(
     skills: Any = None,
     skill_allowlist: list[str] | None = None,
     runner: ScriptRunner | None = None,
+    budget: Budget | None = None,
 ) -> ExecutionResult:
     """
     skills：SkillCaller，提供 ctx.skill()；skill_allowlist：本技能声明可调用的子技能
-    （仅在 toolbox 有工具限制时生效）；runner：脚本在哪里执行，默认进程内
+    （仅在 toolbox 有工具限制时生效）；runner：脚本在哪里执行，默认进程内；
+    budget：调用次数上限（子技能共用），默认不限制
     """
-    bridge = CtxBridge(toolbox=toolbox, llm=llm, task=task, skills=skills, skill_allowlist=skill_allowlist)
+    runner = runner or IN_PROCESS
+    bridge = CtxBridge(
+        toolbox=toolbox, llm=llm, task=task, skills=skills, skill_allowlist=skill_allowlist, runner=runner, budget=budget
+    )
     try:
-        session = await (runner or IN_PROCESS).open(source, task=task, params=params, bridge=bridge)
+        session = await runner.open(source, task=task, params=params, bridge=bridge)
     except ScriptError as e:
         return ExecutionResult(success=False, failed_step="<load>", error=str(e))
     try:
