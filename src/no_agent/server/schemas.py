@@ -90,3 +90,7 @@ class SkillRunRequest(BaseModel):
 
 class VersionRequest(BaseModel):
     version: int
+
+
+class ReviewDecision(BaseModel):
+    comment: str = Field("", description="批准说明 / 拒绝原因")

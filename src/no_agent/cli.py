@@ -44,6 +44,16 @@ def main(argv: list[str] | None = None) -> int:
     p_sign.add_argument("path")
     p_sign.add_argument("--key", required=True, help="私钥文件")
     p_sign.add_argument("--signer", required=True, help="签名者名称（与 trusted_signers 中的键一致）")
+    p_reviews = sub.add_parser("reviews", help="列出等待审查的版本（扩大了能力，没有自动上线）")
+    p_reviews.add_argument("--diff", action="store_true", help="同时显示脚本 diff")
+    p_approve = sub.add_parser("approve", help="批准等待审查的版本")
+    p_approve.add_argument("skill_id")
+    p_approve.add_argument("version", type=int)
+    p_approve.add_argument("--comment", default="")
+    p_reject = sub.add_parser("reject", help="拒绝等待审查的版本")
+    p_reject.add_argument("skill_id")
+    p_reject.add_argument("version", type=int)
+    p_reject.add_argument("--reason", default="审查未通过")
     args = parser.parse_args(argv)
 
     # stdio MCP 用 stdout 传协议数据，日志必须写到 stderr
@@ -64,6 +74,35 @@ def main(argv: list[str] | None = None) -> int:
             rate = f"{s.stats.successes / s.stats.runs:.0%}" if s.stats.runs else "-"
             shadow = f"  候选 v{s.shadow_version}" if s.shadow_version else ""
             print(f"{s.id:<32} {s.kind:<6} {s.status:<8} v{s.active_version}{shadow}  成功率 {rate}  {s.description[:40]}")
+    elif args.cmd == "reviews":
+        items = _agent().reviews()
+        if not items:
+            print("没有等待审查的版本")
+        for r in items:
+            rv = r["review"]
+            print(f"{r['skill_id']} v{r['version']}（{rv['kind']}）: {r['reason']}")
+            for reason in rv["reasons"]:
+                print(f"  - {reason}")
+            if rv["added_imports"]:
+                print(f"  · 新增 import: {', '.join(rv['added_imports'])}")
+            if rv["llm_calls_before"] is not None and rv["llm_calls_after"] != rv["llm_calls_before"]:
+                print(f"  · ctx.llm 调用点: {rv['llm_calls_before']} → {rv['llm_calls_after']}")
+            if rv["atoms"]:
+                print(f"  · 一起新建的原子技能: {', '.join(rv['atoms'])}")
+            if args.diff:
+                print(r["diff"])
+    elif args.cmd in ("approve", "reject"):
+        a = _agent()
+        try:
+            if args.cmd == "approve":
+                s = a.approve(args.skill_id, args.version, args.comment)
+            else:
+                s = a.reject(args.skill_id, args.version, args.reason)
+        except (ValueError, KeyError) as e:
+            print(f"失败: {e}", file=sys.stderr)
+            return 1
+        shadow = f"，候选 v{s.shadow_version} 进入影子运行" if s.shadow_version else ""
+        print(f"{'已批准' if args.cmd == 'approve' else '已拒绝'} {s.id} v{args.version}：状态 {s.status}，当前版本 v{s.active_version}{shadow}")
     elif args.cmd == "install":
         s = _agent().install_skill(args.path, overwrite=args.overwrite)
         print(f"已安装 {s.id}（{s.kind}）")

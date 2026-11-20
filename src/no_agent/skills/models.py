@@ -26,15 +26,37 @@ class TestCase(BaseModel):
     created_at: datetime = Field(default_factory=_now)
 
 
+class Review(BaseModel):
+    """自动上线前的变更审查：新版本扩大了能力时，等人批准后才进入影子运行 / 上线"""
+
+    kind: Literal["patch", "distill", "upgrade"] = "patch"
+    reasons: list[str] = []  # 触发审查的原因（为空则不需要审查）
+    base_version: int | None = None  # 修补时比较的基准版本
+    added_tools: list[str] = []
+    added_skills: list[str] = []
+    dynamic_calls: list[str] = []
+    added_imports: list[str] = []  # 仅记录
+    llm_calls_before: int | None = None  # 仅记录
+    llm_calls_after: int = 0
+    atoms: list[str] = []  # 提炼时一起新建、随本次审查一起批准 / 拒绝的原子技能
+    parent: str | None = None  # 原子技能：由父技能的审查一起决定，不能单独批准
+    requested_at: datetime = Field(default_factory=_now)
+    decided_at: datetime | None = None
+    decision: Literal["approved", "rejected"] | None = None
+    comment: str = ""
+
+
 class VersionInfo(BaseModel):
     version: int
     created_at: datetime = Field(default_factory=_now)
     reason: str = ""
     parent: int | None = None
     test_pass_rate: float | None = None
-    # candidate：影子运行中 | active：当前版本 | superseded：曾经上线、已被替换 | rejected：影子运行未通过
-    status: Literal["candidate", "active", "superseded", "rejected"] = "active"
+    # candidate：影子运行中 | active：当前版本 | superseded：曾经上线、已被替换 | rejected：影子运行或审查未通过
+    # pending_review：扩大了能力，等人批准
+    status: Literal["candidate", "active", "superseded", "rejected", "pending_review"] = "active"
     note: str = ""
+    review: Review | None = None
 
 
 class ShadowRecord(BaseModel):
@@ -136,7 +158,8 @@ class Skill(BaseModel):
     params_schema: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
     permissions: Permissions = Field(default_factory=Permissions)
     # active：正常使用 | shadow：新提炼的技能，影子运行中，尚未对外生效 | retired：已下线
-    status: Literal["active", "shadow", "retired"] = "active"
+    # pending_review：新提炼的技能扩大了能力，等人批准（不会被匹配、调用或执行）
+    status: Literal["active", "shadow", "retired", "pending_review"] = "active"
     # task：可被整任务匹配 | atomic：原子技能，不直接匹配任务，作为积木被其他脚本 ctx.skill() 调用
     role: Literal["task", "atomic"] = "task"
     active_version: int = 0  # 0 = 没有流程脚本（指南型）
@@ -151,6 +174,11 @@ class Skill(BaseModel):
     @property
     def shadow_version(self) -> int | None:
         return self.shadow.version if self.shadow else None
+
+    @property
+    def pending_review(self) -> VersionInfo | None:
+        """等待审查的版本（同一时刻最多一个）"""
+        return next((v for v in self.versions if v.status == "pending_review"), None)
 
     @property
     def kind(self) -> Literal["flow", "guide"]:

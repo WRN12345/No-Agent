@@ -12,6 +12,7 @@ from no_agent.server.schemas import (
     FeedbackRequest,
     RunDetail,
     RunRequest,
+    ReviewDecision,
     RunResponse,
     SkillRunRequest,
     SkillSummary,
@@ -157,6 +158,27 @@ def create_router(agent: Agent | Callable[[], Agent]) -> APIRouter:
         try:
             return _summary(a, a.store.reject_shadow(skill_id, "手动淘汰"))
         except ValueError as e:
+            raise HTTPException(409, str(e)) from e
+
+    @router.get("/reviews", tags=["reviews"])
+    async def list_reviews(a: Agent = Depends(get_agent)) -> list[dict[str, Any]]:
+        """等待审查的版本（扩大了能力，没有自动上线）"""
+        return a.reviews()
+
+    @router.post("/skills/{skill_id}/versions/{version}/approve", tags=["reviews"])
+    async def approve_version(skill_id: str, version: int, req: ReviewDecision, a: Agent = Depends(get_agent)) -> SkillSummary:
+        _skill(a, skill_id)
+        try:
+            return _summary(a, a.approve(skill_id, version, req.comment))
+        except (ValueError, KeyError) as e:
+            raise HTTPException(409, str(e)) from e
+
+    @router.post("/skills/{skill_id}/versions/{version}/reject", tags=["reviews"])
+    async def reject_version(skill_id: str, version: int, req: ReviewDecision, a: Agent = Depends(get_agent)) -> SkillSummary:
+        _skill(a, skill_id)
+        try:
+            return _summary(a, a.reject(skill_id, version, req.comment or "审查未通过"))
+        except (ValueError, KeyError) as e:
             raise HTTPException(409, str(e)) from e
 
     @router.post("/skills/{skill_id}/retire", tags=["skills"])

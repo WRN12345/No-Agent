@@ -172,6 +172,24 @@ no-agent sign skills/fill-form --key team.key --signer team
 
 这一档能保证：脚本即使逃逸了 Python 层的沙箱，也拿不到密钥、绕不过工具和域名权限；死循环会在步骤超时后被终止。它**不**阻止脚本读写当前用户能访问的文件，也不阻止直接联网。需要这一级隔离时，请在 Linux 上使用 `"sandbox"`。设计见 [docs/design/script-isolation.html](docs/design/script-isolation.html)。
 
+## 自动上线前的变更审查
+
+AI 修补或提炼出的新版本，只要**扩大了能力**，就不会自动上线，而是等人批准：
+
+- 用了新的工具：以技能声明的工具为准；没有声明时，以当前版本脚本实际用到的工具为准。新技能则以轨迹里真实用过的工具为准
+- 调用了新的子技能
+- `ctx.tool` / `ctx.skill` 的目标不是字面量，静态分析看不到会调用什么
+
+只改逻辑的修补照常自动上线。新增 import、`ctx.llm` 调用点的变化会记录在审查报告里，但不触发审查。
+
+```bash
+No-Agent reviews --diff                          # 查看待审版本：原因 + 与基准版本的 diff
+No-Agent approve page-title 2 --comment "看过了"  # 批准：之后照常进入影子运行或上线
+No-Agent reject page-title 2 --reason "不该发邮件"
+```
+
+HTTP：`GET /api/v1/reviews`，`POST /api/v1/skills/{id}/versions/{v}/approve`（或 `/reject`）。
+
 ## 浏览器与人机交互
 
 不走"截图 → 看图 → 移鼠标"的 computer use，而是读元素树、批量操作：

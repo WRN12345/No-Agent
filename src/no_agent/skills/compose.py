@@ -53,6 +53,8 @@ class SkillCaller:
         skill = self.store.get(skill_id)
         if skill is None or skill.status == "retired":
             raise SkillCallError(f"技能不存在或已下线: {skill_id}")
+        if skill.status == "pending_review":
+            raise SkillCallError(f"{skill_id} 还在等待审查，不能被调用")
         if skill_id in getattr(self.store, "untrusted", ()):
             raise SkillCallError(f"{skill_id} 是不可信的共享技能（{self.store.trust.get(skill_id, '未签名')}），不能被调用")
         if skill.kind != "flow":

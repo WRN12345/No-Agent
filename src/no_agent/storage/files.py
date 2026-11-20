@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from no_agent.skills import skillmd
-from no_agent.skills.models import ShadowState, Skill, SkillStats, TestCase, VersionInfo
+from no_agent.skills.models import Review, ShadowState, Skill, SkillStats, TestCase, VersionInfo, _now
 from no_agent.skills.script import ScriptError, script_tools, step_docs, validate_script
 from no_agent.storage.base import SKILL_SCHEMA_VERSION as SCHEMA_VERSION
 from no_agent.tools.base import ALWAYS_ALLOWED
@@ -246,8 +246,14 @@ class FileSkillStore:
 
     # ── 写入 ──
 
-    def create(self, skill: Skill, script: str, *, reason: str, pass_rate: float | None = None, shadow: bool = False) -> Skill:
-        """新建流程型技能；shadow=True 时先进入影子运行，转正前不会被匹配使用"""
+    def create(
+        self, skill: Skill, script: str, *, reason: str, pass_rate: float | None = None, shadow: bool = False,
+        review: Review | None = None,
+    ) -> Skill:
+        """
+        新建流程型技能；shadow=True 时先进入影子运行，转正前不会被匹配使用。
+        review 非空：扩大了能力，先等人批准（approve_review）——批准前不会被匹配、调用或执行
+        """
         with self._lock:
             base = slugify(skill.id or skill.name)
             sid, n = base, 2
@@ -256,7 +262,10 @@ class FileSkillStore:
             skill.id = sid
             skill.active_version = 1
             skill.versions = [VersionInfo(version=1, reason=reason, test_pass_rate=pass_rate, status="candidate" if shadow else "active")]
-            if shadow:
+            if review is not None:
+                skill.status = "pending_review"
+                skill.versions[0].status, skill.versions[0].review = "pending_review", review
+            elif shadow:
                 skill.status = "shadow"
                 skill.shadow = ShadowState(version=1)
             if not skill.guide.strip():
@@ -268,9 +277,13 @@ class FileSkillStore:
             self.save(skill)
             return skill
 
-    def add_version(self, skill_id: str, script: str, *, reason: str, pass_rate: float | None, activate: bool = True) -> Skill:
+    def add_version(
+        self, skill_id: str, script: str, *, reason: str, pass_rate: float | None, activate: bool = True,
+        review: Review | None = None,
+    ) -> Skill:
         """
         新增版本。activate=True 直接上线；False 作为候选版本进入影子运行（替换掉之前的候选）。
+        review 非空：扩大了能力，只保存、等人批准（approve_review），不影响当前版本和候选版本。
         """
         with self._lock:
             skill = self._require(skill_id)
@@ -278,6 +291,12 @@ class FileSkillStore:
             v = max((x.version for x in skill.versions), default=0) + 1
             _write_atomic(d / script_relpath(v), script)
             parent = skill.shadow_version or skill.active_version or None
+            if review is not None:
+                skill.versions.append(
+                    VersionInfo(version=v, reason=reason, parent=parent, test_pass_rate=pass_rate, status="pending_review", review=review)
+                )
+                self.save(skill)
+                return skill
             skill.versions.append(VersionInfo(version=v, reason=reason, parent=parent, test_pass_rate=pass_rate, status="candidate"))
             if skill.shadow:  # 被新的候选取代
                 self._version(skill, skill.shadow.version).status = "rejected"
@@ -313,6 +332,66 @@ class FileSkillStore:
             skill.shadow = None
             if skill.status == "shadow":
                 skill.status = "retired"
+            self.save(skill)
+            return skill
+
+    # ── 变更审查 ──
+
+    def _pending(self, skill_id: str, version: int) -> tuple[Skill, VersionInfo]:
+        skill = self._require(skill_id)
+        info = self._version(skill, version)
+        if info.status != "pending_review" or info.review is None:
+            raise ValueError(f"{skill_id} v{version} 没有在等待审查")
+        if info.review.parent:
+            raise ValueError(f"{skill_id} 是随 {info.review.parent} 一起提炼的原子技能，请审查 {info.review.parent}")
+        return skill, info
+
+    def approve_review(self, skill_id: str, version: int, *, shadow: bool, comment: str = "") -> Skill:
+        """
+        批准扩大了能力的版本：之后照常走流程——shadow=True 进入影子运行，否则直接上线。
+        提炼时一起新建的原子技能同时批准。
+        """
+        with self._lock:
+            skill, info = self._pending(skill_id, version)
+            review = info.review
+            assert review is not None
+            review.decision, review.decided_at, review.comment = "approved", _now(), comment
+            if skill.status == "pending_review":  # 新技能
+                if shadow:
+                    skill.status, info.status, skill.shadow = "shadow", "candidate", ShadowState(version=version)
+                else:
+                    skill.status, info.status = "active", "active"
+                for atom_id in review.atoms:
+                    atom = self._cache.get(atom_id)
+                    if atom is not None and atom.status == "pending_review":
+                        atom.status, self._version(atom, atom.active_version).status = "active", "active"
+                        self.save(atom)
+            elif shadow:
+                if skill.shadow:  # 被批准的版本取代之前的候选
+                    old = self._version(skill, skill.shadow.version)
+                    old.status, old.note = "rejected", f"被 v{version} 取代"
+                info.status, skill.shadow = "candidate", ShadowState(version=version)
+            else:
+                self._activate(skill, version)
+            self.save(skill)
+            return skill
+
+    def reject_review(self, skill_id: str, version: int, reason: str = "审查未通过") -> Skill:
+        """拒绝扩大了能力的版本；新技能被拒绝时整个下线（连同一起新建的原子技能）"""
+        with self._lock:
+            skill, info = self._pending(skill_id, version)
+            review = info.review
+            assert review is not None
+            review.decision, review.decided_at, review.comment = "rejected", _now(), reason
+            info.status, info.note = "rejected", reason
+            if skill.status == "pending_review":
+                skill.status = "retired"
+                for atom_id in review.atoms:
+                    atom = self._cache.get(atom_id)
+                    if atom is not None and atom.status == "pending_review":
+                        atom.status = "retired"
+                        self._version(atom, atom.active_version).status = "rejected"
+                        self.save(atom)
             self.save(skill)
             return skill
 

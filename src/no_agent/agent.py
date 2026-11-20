@@ -200,6 +200,36 @@ class Agent:
             raise KeyError(f"技能不存在: {skill_id}")
         return SkillHandle(self, skill_id)
 
+    # ── 变更审查：扩大了能力的新版本 / 新技能，等人批准 ──
+
+    def reviews(self) -> list[dict[str, Any]]:
+        """等待审查的版本：原因、能力变化，以及和基准版本的 diff（新技能给出完整脚本）"""
+        import difflib
+
+        out = []
+        for s in self.store.list(include_retired=True):
+            v = s.pending_review
+            if v is None or v.review is None or v.review.parent:
+                continue
+            new = self.store.script(s.id, v.version)
+            base_v = v.review.base_version
+            if base_v:
+                old = self.store.script(s.id, base_v)
+                diff = "".join(difflib.unified_diff(
+                    old.splitlines(keepends=True), new.splitlines(keepends=True), f"v{base_v}", f"v{v.version}",
+                ))
+            else:
+                diff = new
+            out.append({"skill_id": s.id, "version": v.version, "reason": v.reason, "review": v.review.model_dump(mode="json"), "diff": diff})
+        return out
+
+    def approve(self, skill_id: str, version: int, comment: str = "") -> Skill:
+        """批准：之后照常进入影子运行（shadow_min_runs > 0）或直接上线"""
+        return self.store.approve_review(skill_id, version, shadow=self.config.shadow_min_runs > 0, comment=comment)
+
+    def reject(self, skill_id: str, version: int, reason: str = "审查未通过") -> Skill:
+        return self.store.reject_review(skill_id, version, reason)
+
     def install_skill(self, path: str | Path, *, overwrite: bool = False) -> Skill:
         """
         从目录安装技能到本项目（复制）。可以是本框架产出的技能，也可以是普通的 Anthropic Skill（纯 SKILL.md）。

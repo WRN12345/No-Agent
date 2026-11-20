@@ -25,8 +25,9 @@ from no_agent.llm import LLMs, complete_json, metered
 from no_agent.storage.base import RunStore, SkillStore
 from no_agent.storage.sql import Run
 from no_agent.skills.matcher import SkillMatcher, lexical_similarity
-from no_agent.skills.models import Permissions, ShadowRecord, Skill, TestCase
+from no_agent.skills.models import Permissions, Review, ShadowRecord, Skill, TestCase
 from no_agent.skills.compose import SkillCaller
+from no_agent.skills.review import review_new, review_patch, trace_tools
 from no_agent.skills.runner import Budget, runner_for
 from no_agent.skills.runtime import execute_script
 from no_agent.skills.script import (
@@ -240,6 +241,8 @@ class Evolver:
         skill = self.store.get(run.skill_id or "")
         if skill is None:
             return {"status": "skipped", "reason": "技能不存在"}
+        if (pending := skill.pending_review) is not None:
+            return {"status": "skipped", "skill_id": skill.id, "reason": f"v{pending.version} 还在等待审查"}
         trace = run.trace
         params = (trace.get("match") or {}).get("params", {})
         # 有候选版本时在候选的基础上继续改（它是更新的尝试）
@@ -285,6 +288,19 @@ class Evolver:
             new_case_ok = new_case is None or all(f["case_id"] != new_case.id for f in report.failures)
             if new_case_ok and report.pass_rate >= self.s.promote_min_pass_rate:
                 reason = str(out.get("reason", ""))
+                if review := review_patch(skill, base_version, source, new_source):  # 扩大了能力 → 等人批准
+                    skill = self.store.add_version(skill.id, new_source, reason=reason, pass_rate=report.pass_rate, review=review)
+                    if new_case:
+                        self.store.add_test(skill, new_case, self.s.max_test_cases)
+                    return {
+                        "status": "pending_review",
+                        "skill_id": skill.id,
+                        "version": max(v.version for v in skill.versions),
+                        "pass_rate": report.pass_rate,
+                        "attempts": attempt,
+                        "reason": reason,
+                        "review": review.reasons,
+                    }
                 skill = self.store.add_version(
                     skill.id, new_source, reason=reason, pass_rate=report.pass_rate, activate=not self._use_shadow
                 )
@@ -347,7 +363,9 @@ class Evolver:
         run = self.runs.get(run.id) or run
         if run.distilled_into:
             return {"status": "skipped", "reason": "已提炼"}
-        existing = [s for s in self.store.list(include_retired=True) if s.status in ("active", "shadow") and s.role == "task"]
+        existing = [
+            s for s in self.store.list(include_retired=True) if s.status in ("active", "shadow", "pending_review") and s.role == "task"
+        ]
         cands = [s for s, _ in await self.matcher.candidates(run.task, existing)]
         if cands and await self.matcher.match(run.task, only=cands):
             return {"status": "skipped", "reason": "已有技能（含影子运行中的）可覆盖该任务"}
@@ -365,15 +383,30 @@ class Evolver:
         if syn["status"] != "ok":
             return {k: v for k, v in syn.items() if k != "status"} | {"status": syn["status"]}
 
-        atoms = self._create_atoms(syn["atoms"])
         skill: Skill = syn["skill"]
-        skill.tests = syn["cases"]
-        skill = self.store.create(
-            skill, syn["script"], reason=f"从 {len(syn['used'])} 条轨迹提炼", pass_rate=syn["pass_rate"], shadow=self._use_shadow
+        review = review_new(
+            "distill", syn["script"], trace_tools=trace_tools(syn["used"]),
+            atoms={sid: src for sid, (_, src) in syn["atoms"].items()},
         )
+        atoms = self._create_atoms(syn["atoms"], parent=skill.id if review else None)
+        skill.tests = syn["cases"]
+        if review:
+            review.atoms = atoms
+        intended = skill.id
+        skill = self.store.create(
+            skill, syn["script"], reason=f"从 {len(syn['used'])} 条轨迹提炼", pass_rate=syn["pass_rate"], shadow=self._use_shadow,
+            review=review,
+        )
+        if review and skill.id != intended:  # id 冲突被改名：原子技能的审查跟着指向新 id
+            for atom_id in atoms:
+                atom = self.store.get(atom_id)
+                if atom and (v := atom.pending_review) and v.review:
+                    v.review.parent = skill.id
+                    self.store.save(atom)
         self._mark(syn["used"], skill.id)
         return {
-            "status": "shadow" if self._use_shadow else "created",
+            "status": "pending_review" if review else "shadow" if self._use_shadow else "created",
+            "review": review.reasons if review else [],
             "skill_id": skill.id,
             "traces": len(syn["used"]),
             "pass_rate": syn["pass_rate"],
@@ -392,6 +425,8 @@ class Evolver:
             return {"status": "skipped", "reason": "不是指南型技能"}
         if skill.shadow:
             return {"status": "skipped", "reason": "已有候选脚本在影子运行"}
+        if (pending := skill.pending_review) is not None:
+            return {"status": "skipped", "skill_id": skill_id, "reason": f"v{pending.version} 还在等待审查"}
         runs = [
             r for r in self.runs.list(limit=50, skill_id=skill_id)
             if r.mode == "guide" and r.success and r.tool_call_count > 0 and not r.distilled_into
@@ -407,7 +442,13 @@ class Evolver:
         if syn["status"] != "ok":
             return {k: v for k, v in syn.items() if k != "status"} | {"status": syn["status"], "skill_id": skill_id}
 
-        atoms = self._create_atoms(syn["atoms"])
+        review = review_new(
+            "upgrade", syn["script"], trace_tools=trace_tools(syn["used"]), declared_tools=skill.permissions.tools,
+            atoms={sid: src for sid, (_, src) in syn["atoms"].items()},
+        )
+        atoms = self._create_atoms(syn["atoms"], parent=skill_id if review else None)
+        if review:
+            review.atoms = atoms
         learned: Skill = syn["skill"]
         skill.params_schema = learned.params_schema  # 指南型原本没有参数；转正前不影响按指南执行
         skill.permissions = learned.permissions
@@ -416,8 +457,14 @@ class Evolver:
         self.store.save(skill)
         skill = self.store.add_version(
             skill_id, syn["script"], reason=f"从 {len(syn['used'])} 次指南执行中提炼", pass_rate=syn["pass_rate"],
-            activate=not self._use_shadow,
+            activate=not self._use_shadow, review=review,
         )
+        if review:
+            self._mark(syn["used"], skill_id)
+            return {
+                "status": "pending_review", "skill_id": skill_id, "version": max(v.version for v in skill.versions),
+                "review": review.reasons, "atoms": atoms,
+            }
         self._mark(syn["used"], skill_id)
         return {
             "status": "candidate" if self._use_shadow else "promoted",
@@ -521,10 +568,12 @@ class Evolver:
             overlay[sid] = (atom, source)
         return overlay
 
-    def _create_atoms(self, overlay: dict[str, tuple[Skill, str]]) -> list[str]:
+    def _create_atoms(self, overlay: dict[str, tuple[Skill, str]], parent: str | None = None) -> list[str]:
+        """parent 非空：父技能需要审查，原子技能随它一起等待批准"""
         created = []
         for sid, (atom, source) in overlay.items():
-            created.append(self.store.create(atom, source, reason="提炼时抽出的原子技能").id)
+            review = Review(kind="distill", reasons=[f"随 {parent} 一起审查"], parent=parent) if parent else None
+            created.append(self.store.create(atom, source, reason="提炼时抽出的原子技能", review=review).id)
         return created
 
     def _seen_domains(self, runs: list[Run]) -> list[str]:
