@@ -425,6 +425,13 @@ SandboxRunner     # ProcessRunner + 操作系统约束；不可用时 open() 抛
     <h3>自动上线前的变更审查</h3>
     <p>修补或提炼出的新版本如果新增了 import、工具或子技能调用，或者用到了 <code>ctx.llm</code> 的新调用点，不自动上线，转为等待人工确认。这是止血补丁里留下的另一项。</p>
     <p class="accept"><b>验收：</b>只改动逻辑的修补照常自动上线；扩大能力的修补进入待审状态，可以通过 API 和 CLI 批准。</p>
+    <p class="accept"><b>状态：</b>已实现（<code>skills/review.py</code>）。触发待审的条件：
+    新增工具，基准是技能声明的工具，没有声明时以当前版本脚本实际用到的工具为准；
+    新增子技能调用；
+    动态调用，即 <code>ctx.tool</code> / <code>ctx.skill</code> 的目标不是字面量，或者先赋给变量再调用，静态分析看不到会调用什么；
+    提炼出的新技能或指南升级出的脚本，用到了轨迹里没出现过的工具（原子技能一起检查，并随父技能一起批准或拒绝）。
+    与草案的差异：新增 import 和 <code>ctx.llm</code> 调用点的变化只记录在审查报告里，不触发待审。几乎每次正常修补都会碰到这两项，触发审查只会造成审查疲劳；而白名单模块都是纯计算模块，在子进程隔离下也不是拿到密钥的路径。
+    待审期间不会再对同一技能发起新的修补或提炼。审批入口：<code>agent.reviews()</code> / <code>approve()</code> / <code>reject()</code>、<code>GET /api/v1/reviews</code>、<code>POST /api/v1/skills/{id}/versions/{v}/approve|reject</code>、<code>No-Agent reviews|approve|reject</code>。</p>
   </div>
 </div>
 </section>
