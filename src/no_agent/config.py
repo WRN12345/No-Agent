@@ -5,8 +5,12 @@
     AgentConfig(llm=LLMConfig(api_key=..., fast_model=..., strong_model=...), home="./.no-agent")
 
 也可以从环境变量读取（前缀 NO_AGENT_，嵌套用双下划线）：
-    NO_AGENT_LLM__API_KEY=...  NO_AGENT_HOME=...
+    NO_AGENT_LLM__API_KEY=...  NO_AGENT_SCRIPT_ISOLATION=sandbox
     AgentConfig.from_env()
+
+环境变量只在 from_env() 里生效（CLI 和 HTTP 服务用的就是它）；直接构造 AgentConfig(...) 时不读环境变量，
+嵌入方写什么就是什么，不会被机器上的环境变量或 .env 悄悄改掉。唯一的例外是 NO_AGENT_HOME：
+确定数据目录时总会参考它（见 storage/home.py）。
 """
 
 from __future__ import annotations

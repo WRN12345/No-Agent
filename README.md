@@ -29,7 +29,7 @@ pip install "git+https://github.com/WRN12345/No-Agent.git"
 pip install "No-Agent[browser,mcp] @ git+https://github.com/WRN12345/No-Agent.git"   # 带可选依赖
 ```
 
-本仓库开发：`pip install -e ".[dev]" && python -m pytest`（离线跑通完整进化闭环，使用假 LLM）。
+本仓库开发：`pip install -e ".[dev]" && python -m pytest`（离线跑通完整进化闭环，使用假 LLM）。在 Linux 上用 sandbox 档跑整套测试：`NO_AGENT_SCRIPT_ISOLATION=sandbox python -m pytest`。
 
 ## 作为库使用
 
@@ -56,7 +56,7 @@ async with agent:                                  # 启动后台进化器；退
 run = agent.run_sync("查一下所有待发货的订单")      # 同步代码中使用
 ```
 
-也可以从环境变量读配置：`Agent(AgentConfig.from_env())`，变量见 [.env.example](.env.example)（前缀 `NO_AGENT_`）。
+也可以从环境变量读配置：`Agent(AgentConfig.from_env())`，变量见 [.env.example](.env.example)（前缀 `NO_AGENT_`）。环境变量只在 `from_env()` 里生效，CLI 和 HTTP 服务（包括 Docker 镜像）用的就是它；直接构造 `AgentConfig(...)` 时不读环境变量（`NO_AGENT_HOME` 除外，见下文“`.no-agent/` 的位置”）。
 
 ### 显式调用技能
 

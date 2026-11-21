@@ -12,6 +12,11 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, windows-latest]
         python: ["3.10", "3.12"]
+        isolation: [process]
+        # 整套测试在 sandbox 档下再跑一遍（只支持 Linux）
+        include:
+          - { os: ubuntu-24.04, python: "3.12", isolation: sandbox }
+          - { os: ubuntu-24.04-arm, python: "3.12", isolation: sandbox }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -26,4 +31,6 @@ jobs:
           uname -a
           cat /sys/kernel/security/lsm || true
       - name: 测试
+        env:
+          NO_AGENT_SCRIPT_ISOLATION: ${{ matrix.isolation }}
         run: python -m pytest -q -rs

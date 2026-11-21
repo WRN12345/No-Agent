@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import typing
 from typing import Any, Callable
 
 import pytest
@@ -10,6 +12,22 @@ import pytest
 from no_agent import Agent, AgentConfig
 from no_agent.llm import BaseLLM, LLMReply, LLMs, ToolCall
 from no_agent.tools.base import ToolError, tool
+
+# 用 NO_AGENT_SCRIPT_ISOLATION 切换整套测试的默认隔离档位，例如在 Linux 上跑一遍 sandbox 档：
+#   NO_AGENT_SCRIPT_ISOLATION=sandbox python -m pytest
+# AgentConfig() 本身不读环境变量（只有 from_env / CLI / HTTP 服务读），所以这里直接改字段默认值；
+# 测试里显式指定的档位不受影响。
+_ISOLATION = os.environ.get("NO_AGENT_SCRIPT_ISOLATION", "").strip()
+if _ISOLATION:
+    _allowed = typing.get_args(AgentConfig.model_fields["script_isolation"].annotation)
+    if _ISOLATION not in _allowed:
+        raise pytest.UsageError(f"NO_AGENT_SCRIPT_ISOLATION={_ISOLATION!r} 无效，可选值：{', '.join(_allowed)}")
+    AgentConfig.model_fields["script_isolation"].default = _ISOLATION
+    AgentConfig.model_rebuild(force=True)
+
+
+def pytest_report_header(config):
+    return f"script_isolation 默认档位: {AgentConfig().script_isolation}"
 
 Handler = Callable[[list[dict[str, Any]], list[dict[str, Any]] | None], LLMReply]
 
