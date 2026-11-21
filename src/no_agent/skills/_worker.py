@@ -25,6 +25,8 @@ import json
 import os
 import struct
 import sys
+import threading
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -93,15 +95,16 @@ class WorkerAbort(Exception):
     """用户取消（对应 no_agent.tools.base.UserAbort）"""
 
 
-def _apply_limits(memory_mb: int, cpu_s: int) -> None:
-    """POSIX 上限制自身资源（Windows 由宿主用 Job Object 限制）。worker 自己的代码可信，在加载脚本之前执行"""
+def _apply_limits(memory_mb: int, cpu_s: int) -> bool:
+    """
+    POSIX 上限制自身资源（Windows 由宿主用 Job Object 限制）。worker 自己的代码可信，在加载脚本之前执行。
+    返回内存上限是否已由操作系统强制执行；False 时（macOS 不支持 RLIMIT_AS）需要 MemoryGuard 兜底
+    """
     if os.name != "posix":
-        return
+        return True
     import resource
 
     limits = [(getattr(resource, "RLIMIT_NPROC", None), 0)]  # 不能再创建进程（root 用户不受此限制）
-    if memory_mb > 0:
-        limits.append((resource.RLIMIT_AS, memory_mb * 1024 * 1024))
     if cpu_s > 0:
         limits.append((resource.RLIMIT_CPU, cpu_s))  # 兜底：宿主崩溃时，失控的脚本也会被内核终止
     for res, value in limits:
@@ -111,6 +114,66 @@ def _apply_limits(memory_mb: int, cpu_s: int) -> None:
             resource.setrlimit(res, (value, value))
         except (ValueError, OSError):
             pass
+    if memory_mb <= 0:
+        return True
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (memory_mb * 1024 * 1024,) * 2)
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _peak_rss() -> int:
+    """本进程的峰值常驻内存（字节）。ru_maxrss 在 macOS 上以字节计，在 Linux 上以 KB 计"""
+    import resource
+
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak if sys.platform == "darwin" else peak * 1024
+
+
+class MemoryGuard:
+    """
+    操作系统无法强制内存上限时（macOS 不支持 RLIMIT_AS）的兜底：按峰值常驻内存判断。
+    worker 用一次就丢，所以峰值一旦超限，这次执行就到此为止：
+      - 每个阶段结束时检查（确定性的）：超限则该阶段判为 MemoryError
+      - 后台看门狗：阶段执行中超限，向主线程注入 MemoryError（在下一条字节码处生效）；
+        宽限期后进程仍在运行（例如脚本吞掉了异常），直接退出
+    它不能阻止单次超大的分配本身发生，只能在分配之后终止执行。
+    """
+
+    POLL = 0.05
+    GRACE = 2.0
+
+    def __init__(self, limit_mb: int, read_peak: Any = _peak_rss) -> None:
+        self.limit_mb = limit_mb
+        self.limit = limit_mb * 1024 * 1024
+        self._read_peak = read_peak
+        self.in_phase = False  # 只在阶段执行中注入异常，避免打断 worker 自己的协议处理
+
+    def exceeded(self) -> bool:
+        return self._read_peak() > self.limit
+
+    def message(self) -> str:
+        return f"MemoryError: 超出内存上限 {self.limit_mb} MB（峰值 {self._read_peak() // (1024 * 1024)} MB）"
+
+    def start(self, main_thread_id: int) -> None:
+        threading.Thread(target=self._watch, args=(main_thread_id,), name="memory-guard", daemon=True).start()
+
+    def _watch(self, main_thread_id: int) -> None:
+        import ctypes
+
+        while True:
+            time.sleep(self.POLL)
+            if not (self.in_phase and self.exceeded()):
+                continue
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(main_thread_id), ctypes.py_object(MemoryError))
+            time.sleep(self.GRACE)
+            self.terminate()
+            return
+
+    def terminate(self) -> None:
+        print(f"[worker] {self.message()}，终止", file=sys.stderr, flush=True)
+        os._exit(137)
 
 
 def _load_module(name: str, path: Path) -> Any:
@@ -133,6 +196,7 @@ class Worker:
         self.next_id = 0
         self.kinds = sb.ErrorKinds(tool_error=(WorkerToolError,), abort=(WorkerAbort,))
         self._error_types: dict[str, type[Exception]] = {}
+        self.memory_guard: MemoryGuard | None = None
 
     def send(self, obj: dict[str, Any]) -> None:
         write_frame(self.out, obj)
@@ -160,9 +224,24 @@ class Worker:
         self.send({"op": "loaded", "steps": [s.name for s in self.loaded.steps]})
 
     def _run(self, msg: dict[str, Any]) -> None:
-        out = self.loop.run_until_complete(
-            self.sb.run_phase(self.loaded, self.ctx, msg.get("phase"), str(msg.get("name", "")), self.kinds)
-        )
+        guard = self.memory_guard
+        if guard is not None:
+            guard.in_phase = True
+        try:
+            try:
+                out = self.loop.run_until_complete(
+                    self.sb.run_phase(self.loaded, self.ctx, msg.get("phase"), str(msg.get("name", "")), self.kinds)
+                )
+            finally:
+                if guard is not None:
+                    guard.in_phase = False
+        except MemoryError:
+            if guard is None:
+                raise
+            # 看门狗的注入恰好落在阶段收尾的那几条字节码上（不在脚本里）：同样按超限处理
+            out = self.sb.PhaseOutcome("error", guard.message())
+        if guard is not None and guard.exceeded():
+            out = self.sb.PhaseOutcome("error", guard.message())
         snap = asdict(self.sb.snapshot(self.ctx))
         if len(json.dumps(snap["result"], ensure_ascii=False, default=str)) > RESULT_LIMIT:
             snap["result"] = self.sb.clip(snap["result"], RESULT_LIMIT)
@@ -219,7 +298,7 @@ def main() -> None:
     memory_mb, cpu_s = (int(a) for a in sys.argv[1:3])
     sandboxed = len(sys.argv) > 3 and sys.argv[3] == "sandbox"
     tzdata_dir = sys.argv[4] if len(sys.argv) > 4 else ""
-    _apply_limits(memory_mb, cpu_s)
+    memory_enforced = _apply_limits(memory_mb, cpu_s)
     if tzdata_dir and os.path.isabs(tzdata_dir):
         # 宿主的 tzdata 时区文件（Windows 没有系统时区库）；要在预热 import 与 sandbox 计算放行路径之前设置
         import zoneinfo
@@ -246,8 +325,12 @@ def main() -> None:
             write_frame(out, {"op": "failed", "kind": "sandbox", "message": f"{type(e).__name__}: {e}"})
             sys.exit(3)
     write_frame(out, {"op": "ready", "confinement": confinement})
+    worker = Worker(sb, inp, out, loop)
+    if not memory_enforced:  # macOS：内核不支持 RLIMIT_AS，按峰值常驻内存兜底
+        worker.memory_guard = MemoryGuard(memory_mb)
+        worker.memory_guard.start(threading.get_ident())
     try:
-        Worker(sb, inp, out, loop).serve()
+        worker.serve()
     except ProtocolError as e:
         print(f"[worker] 协议错误: {e}", file=sys.stderr)
         sys.exit(2)

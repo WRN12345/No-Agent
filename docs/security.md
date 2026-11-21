@@ -20,7 +20,7 @@ AI 会自己写脚本、改脚本、从共享库加载别人的脚本，所以�
 |---|---|---|
 | `script_isolation` | `"process"` | `"sandbox"`：在 `process` 之上再加内核约束（仅 Linux，需 5.13+ 且启用 Landlock），只读文件系统，禁止联网、执行程序、创建进程；内核不支持时拒绝启动。`"inprocess"`：在本进程内执行，只有 Python 层的白名单，仅用于测试或完全信任所有脚本的场景 |
 | `worker_pool_size` | `2` | 预热的空子进程数 |
-| `worker_memory_mb` | `512` | 每个子进程的内存上限 |
+| `worker_memory_mb` | `512` | 每个子进程的内存上限。Linux 用 `RLIMIT_AS`、Windows 用 Job Object，超限的分配直接失败；macOS 不支持 `RLIMIT_AS`，改为按峰值常驻内存检查：超限后终止这次执行（报 `MemoryError`），但拦不住单次超大的分配本身 |
 | `worker_cpu_seconds` | `300` | CPU 时间兜底上限，主进程崩溃时也能终止失控的脚本 |
 | `script_max_tool_calls` / `script_max_llm_calls` | `500` / `100` | 一次执行（含子技能）的调用次数上限 |
 

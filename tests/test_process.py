@@ -241,5 +241,81 @@ def test_posix_limits_are_applied(monkeypatch):
     fake = types.SimpleNamespace(RLIMIT_NPROC=1, RLIMIT_AS=2, RLIMIT_CPU=3, setrlimit=lambda r, v: calls.__setitem__(r, v))
     monkeypatch.setitem(sys.modules, "resource", fake)
     monkeypatch.setattr(_worker, "os", types.SimpleNamespace(name="posix"))
-    _worker._apply_limits(256, 60)
+    assert _worker._apply_limits(256, 60) is True  # 内存上限由内核强制执行
     assert calls == {1: (0, 0), 2: (256 * 1024 * 1024,) * 2, 3: (60, 60)}
+
+
+def _fake_resource_without_rlimit_as(monkeypatch):
+    """模拟 macOS：setrlimit(RLIMIT_AS) 报错"""
+    import sys
+    import types
+
+    from no_agent.skills import _worker
+
+    def setrlimit(res, value):
+        if res == 2:
+            raise ValueError("not supported")
+
+    fake = types.SimpleNamespace(RLIMIT_NPROC=1, RLIMIT_AS=2, RLIMIT_CPU=3, setrlimit=setrlimit)
+    monkeypatch.setitem(sys.modules, "resource", fake)
+    monkeypatch.setattr(_worker, "os", types.SimpleNamespace(name="posix"))
+    return _worker
+
+
+def test_apply_limits_reports_unenforced_memory_limit(monkeypatch):
+    _worker = _fake_resource_without_rlimit_as(monkeypatch)
+    assert _worker._apply_limits(256, 60) is False  # 需要 MemoryGuard 兜底
+    assert _worker._apply_limits(0, 60) is True  # 不限制内存时无所谓
+
+
+def _phase_worker(guard):
+    """直接驱动 worker 的 _run（不启动子进程），返回它发出的 done 帧"""
+    import io
+
+    from no_agent.skills import _worker, sandbox
+
+    out = io.BytesIO()
+    loop = asyncio.new_event_loop()
+    w = _worker.Worker(sandbox, io.BytesIO(), out, loop)
+    w.memory_guard = guard
+    w._load({"source": '@step\nasync def a(ctx):\n    return 1\n', "task": "t", "params": {}})
+    out.seek(0)
+    out.truncate()
+    try:
+        w._run({"phase": "step", "name": "a"})
+    finally:
+        loop.close()
+    out.seek(0)
+    return _worker.read_frame(out)
+
+
+def test_memory_guard_fails_phase_when_peak_exceeds_limit():
+    from no_agent.skills._worker import MemoryGuard
+
+    mb = 1024 * 1024
+    done = _phase_worker(MemoryGuard(256, read_peak=lambda: 300 * mb))
+    assert done["status"] == "error" and done["message"] == "MemoryError: 超出内存上限 256 MB（峰值 300 MB）"
+
+    done = _phase_worker(MemoryGuard(256, read_peak=lambda: 100 * mb))
+    assert done["status"] == "ok"  # 没超限：照常
+
+
+def test_memory_guard_watchdog_interrupts_running_phase():
+    import threading
+
+    from no_agent.skills._worker import MemoryGuard
+
+    peak = {"v": 0}
+    guard = MemoryGuard(1, read_peak=lambda: peak["v"])
+    terminated = threading.Event()
+    guard.GRACE = 0.1
+    guard.terminate = terminated.set  # type: ignore[method-assign]  # 测试里不能真的退出进程
+    guard.in_phase = True
+    guard.start(threading.get_ident())
+
+    peak["v"] = 2 * 1024 * 1024  # 执行中超限
+    with pytest.raises(MemoryError):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:  # 模拟一直在跑的脚本：注入的 MemoryError 在下一条字节码处生效
+            pass
+    assert terminated.wait(2)  # 宽限期后终止进程
