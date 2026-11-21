@@ -79,6 +79,13 @@ async def test_mcp_server_lists_and_calls_skills(agent, served, web, strong):
         strong.on("freeform", lambda m, t: tool_reply("finish", {"success": True, "result": "done"}))
         r = text(await client.call_tool("run_task", {"task": "随便做点什么", "mode": "freeform"}))
         assert r["mode"] == "freeform" and r["result"] == "done"
+
+        # 用返回的 run_id 反馈（自由执行的运行：只记录，不触发修补）
+        fb = text(await client.call_tool("feedback", {"run_id": r["run_id"], "score": 1, "comment": "好"}))
+        assert fb == {"ok": True, "patch_queued": False}
+        assert agent.runs.get(r["run_id"]).feedback_score == 1
+        bad = await client.call_tool("feedback", {"run_id": "nope", "score": 1})
+        assert bad.isError and "运行记录不存在" in bad.content[0].text
     await agent.stop()
 
 
