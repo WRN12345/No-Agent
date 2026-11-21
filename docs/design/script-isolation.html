@@ -415,7 +415,9 @@ SandboxRunner     # ProcessRunner + 操作系统约束；不可用时 open() 抛
     <h3>SandboxRunner（Linux）</h3>
     <p>实现 Landlock 和 seccomp，不可用时拒绝启动。规定 <code>untrusted_shared="shadow"</code> 必须配合 sandbox 档。在 Docker 镜像里验证。</p>
     <p class="accept"><b>验收：</b>在 worker 内读 <code>/etc/passwd</code>、建立 socket、执行 <code>execve</code> 都失败；内核不支持时给出明确错误，不降级。</p>
-    <p class="accept"><b>状态：</b>已在 Debian 13（内核 6.12，x86_64，Landlock ABI 6，非 root 用户）上验证：读 <code>/etc/passwd</code>、写 <code>/tmp</code>、建立 socket、fork、执行程序、给父进程发信号都被拒绝；线程、标准库读取、<code>ZoneInfo</code> 正常；系统调用号与内核头文件逐个核对一致（x86_64 共 48 个，aarch64 共 44 个）；默认档位改成 sandbox 后全量测试全部通过。验证中发现并修复了一个问题：Linux 上的事件循环在创建时要建一对 socket，必须在进入 sandbox 之前创建。aarch64 上的真实运行和 Docker 内的行为仍待验证。</p>
+    <p class="accept"><b>状态：</b>已在 Debian 13（内核 6.12，x86_64，Landlock ABI 6，非 root 用户）上验证：读 <code>/etc/passwd</code>、写 <code>/tmp</code>、建立 socket、fork、执行程序、给父进程发信号都被拒绝；线程、标准库读取、<code>ZoneInfo</code> 正常；系统调用号与内核头文件逐个核对一致（x86_64 共 48 个，aarch64 共 44 个）；默认档位改成 sandbox 后全量测试全部通过。验证中发现并修复了一个问题：Linux 上的事件循环在创建时要建一对 socket，必须在进入 sandbox 之前创建。
+    Docker 内（Docker 29.3.1，默认 seccomp 配置，<code>python:3.12-slim</code> 生产镜像，root 和 uid 1000 各跑一遍）：内核约束探针全部被拦截；默认档位改成 sandbox 后全量测试通过；用自定义 seccomp 配置拦掉 <code>landlock_*</code> 或 <code>prctl(PR_SET_SECCOMP)</code> 时，worker 以 <code>WorkerStartError</code> 拒绝启动，不降级。
+    aarch64：CI 的 <code>ubuntu-24.04-arm</code>（Python 3.10 / 3.12）全量测试通过，内核约束测试在 Linux 上不可跳过。</p>
     <p class="accept"><b>原计划：</b>代码已完成，待在 Linux 上验证。实现在 <code>skills/_confine.py</code>：Landlock 只读放行 Python 安装目录、<code>sys.path</code> 和时区数据，不允许写任何地方；seccomp 用手写 BPF 过滤器，不加依赖，支持 x86_64 和 aarch64。过滤器禁止 socket、execve、创建进程（只允许带 <code>CLONE_THREAD</code> 的 clone）、ptrace、io_uring 等调用，发信号只能发给自己。过滤器逻辑在所有平台上用 BPF 解释器逐条验证过；真实的内核约束和系统调用号核对，只在 Linux 上运行。</p>
   </div>
 </div>
