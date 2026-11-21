@@ -1,6 +1,7 @@
 """P2：脚本在一次性子进程中执行"""
 
 import asyncio
+import os
 import time
 
 import pytest
@@ -164,12 +165,63 @@ def test_worker_environment_is_minimal(monkeypatch, tmp_path):
     assert captured["cmd"][1:4] == ["-I", "-X", "utf8"] and captured["cwd"] != str(tmp_path)
 
 
+async def test_zoneinfo_works_in_worker(runner):
+    """Windows 没有系统时区库，worker 靠宿主传来的 tzdata 目录"""
+    src = """
+import datetime
+import zoneinfo
+
+@step
+async def a(ctx):
+    tz = zoneinfo.ZoneInfo("Asia/Shanghai")
+    return str(datetime.datetime(2026, 1, 1, tzinfo=tz).utcoffset())
+"""
+    res = await run(src, runner)
+    assert res.success, res.error
+    assert res.result == "8:00:00"
+
+
+def test_worker_starts_from_a_venv(tmp_path):
+    """
+    宿主跑在 venv 里时 worker 也能启动。
+    Windows 上 venv 的 python.exe 是启动器，要再起一个真正的解释器，会被 Job Object 的进程数上限挡住；
+    CI 用的是真实解释器，不加这个测试就覆盖不到。
+    """
+    import os
+    import subprocess
+    import sys
+    import venv
+
+    venv.EnvBuilder(with_pip=False).create(tmp_path / "v")
+    py = tmp_path / "v" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    code = r"""
+import asyncio
+from no_agent.skills.process import ProcessRunner, WorkerPool
+from no_agent.skills.runtime import execute_script
+from tests.test_process import _box
+from tests.test_script import NoLLM
+
+SRC = "import zoneinfo\n@step\nasync def a(ctx):\n    r = await ctx.tool('echo', text=str(zoneinfo.ZoneInfo('UTC')))\n    return r['echo']\n"
+
+async def main():
+    res = await execute_script(SRC, task="t", params={}, toolbox=_box(), llm=NoLLM(), runner=ProcessRunner(WorkerPool(0, 256, 60)))
+    print("RESULT", res.success, res.result, res.error)
+
+asyncio.run(main())
+"""
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)}
+    proc = subprocess.run([str(py), "-c", code], capture_output=True, text=True, encoding="utf-8", timeout=120, env=env, cwd=tmp_path)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "RESULT True UTC None" in proc.stdout, proc.stdout[-2000:] + proc.stderr[-2000:]
+
+
 async def test_concurrent_executions(runner):
     src = '@step\nasync def a(ctx):\n    r = await ctx.tool("echo", text=str(ctx.params["n"]))\n    return r["echo"]\n'
     results = await asyncio.gather(*(execute_script(src, task="t", params={"n": i}, toolbox=_box(), llm=NoLLM(), runner=runner) for i in range(6)))
     assert [r.result for r in results] == [str(i) for i in range(6)]
 
 
+@pytest.mark.skipif(bool(os.environ.get("NO_AGENT_SCRIPT_ISOLATION")), reason="已用 NO_AGENT_SCRIPT_ISOLATION 改了默认档位")
 async def test_agent_uses_process_runner_by_default():
     from no_agent import AgentConfig
     from no_agent.skills.runner import runner_for

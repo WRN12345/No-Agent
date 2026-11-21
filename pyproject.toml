@@ -16,6 +16,8 @@ dependencies = [
     "openai>=1.50",
     "httpx>=0.27",
     "pyyaml>=6.0",
+    # Windows 没有系统时区库，脚本里的 zoneinfo 靠它（宿主把目录传给 worker）
+    "tzdata; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

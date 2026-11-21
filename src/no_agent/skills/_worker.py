@@ -218,7 +218,13 @@ def _read_paths() -> list[str]:
 def main() -> None:
     memory_mb, cpu_s = (int(a) for a in sys.argv[1:3])
     sandboxed = len(sys.argv) > 3 and sys.argv[3] == "sandbox"
+    tzdata_dir = sys.argv[4] if len(sys.argv) > 4 else ""
     _apply_limits(memory_mb, cpu_s)
+    if tzdata_dir and os.path.isabs(tzdata_dir):
+        # 宿主的 tzdata 时区文件（Windows 没有系统时区库）；要在预热 import 与 sandbox 计算放行路径之前设置
+        import zoneinfo
+
+        zoneinfo.reset_tzpath(to=[*zoneinfo.TZPATH, tzdata_dir])
     sb = _load_module("no_agent_worker_sandbox", Path(__file__).resolve().with_name("sandbox.py"))
     for m in sorted(sb.ALLOWED_IMPORTS | sb.ALLOWED_SUBMODULES):  # 预热：脚本里的 import 不再计入步骤耗时
         try:

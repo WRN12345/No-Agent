@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import functools
+import importlib.util
 import logging
 import os
 import shutil
@@ -102,6 +104,40 @@ def _windows_job(proc: subprocess.Popen, memory_mb: int, cpu_s: int) -> Any:
     return (k32, job)
 
 
+def _worker_executable() -> str:
+    """
+    启动 worker 用的解释器。
+
+    Windows 上 venv 里的 python.exe 只是启动器，它还要再起一个真正的解释器进程，
+    会被 Job Object 的进程数上限（1）挡住。worker 只用标准库（并且带 -I 启动），直接用底层解释器即可，
+    同时也避开了"启动器先派生出子进程、之后才挂上 Job Object"的竞态。
+    """
+    if os.name == "nt":
+        base = getattr(sys, "_base_executable", "")
+        if base and os.path.normcase(base) != os.path.normcase(sys.executable) and os.path.isfile(base):
+            return base
+    return sys.executable
+
+
+@functools.lru_cache(maxsize=1)
+def _tzdata_dir() -> str:
+    """
+    宿主环境里 tzdata 包的时区文件目录；找不到返回空串。
+
+    Windows 没有系统时区库，ZoneInfo 靠 tzdata 包；而 worker 用的是底层解释器、带 -I 启动，
+    看不到宿主 venv 的 site-packages。把目录显式传过去，只放行时区数据，不暴露其他包。
+    """
+    try:
+        spec = importlib.util.find_spec("tzdata")
+    except (ImportError, ValueError):
+        return ""
+    for loc in (spec.submodule_search_locations or []) if spec else []:
+        d = Path(loc).resolve() / "zoneinfo"
+        if d.is_dir():
+            return str(d)
+    return ""
+
+
 def _minimal_env(tmp: str) -> dict[str, str]:
     if os.name == "nt":
         env = {k: os.environ[k] for k in ("SYSTEMROOT", "WINDIR") if k in os.environ}
@@ -125,7 +161,7 @@ class WorkerProcess:
         mode = "sandbox" if sandbox else "process"
         try:
             self.proc = subprocess.Popen(
-                [sys.executable, "-I", "-X", "utf8", str(WORKER_PATH), str(memory_mb), str(cpu_s), mode],
+                [_worker_executable(), "-I", "-X", "utf8", str(WORKER_PATH), str(memory_mb), str(cpu_s), mode, _tzdata_dir()],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 cwd=self.tmp, env=_minimal_env(self.tmp), creationflags=flags, close_fds=True,
                 start_new_session=os.name == "posix",  # 独立的进程组：kill(0, …) 打不到宿主
