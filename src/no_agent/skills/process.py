@@ -435,11 +435,11 @@ class ProcessSession:
         name, args = msg.get("name"), msg.get("args")
         try:
             if kind == "tool" and isinstance(name, str) and isinstance(args, dict):
-                value = await self._bridge.tool(name, args)
+                value = await self._while_alive(self._bridge.tool(name, args))
             elif kind == "skill" and isinstance(name, str) and isinstance(args, dict):
-                value = await self._bridge.skill(name, args)
+                value = await self._while_alive(self._bridge.skill(name, args))
             elif kind == "llm" and isinstance(msg.get("instruction"), str):
-                value = await self._bridge.llm(msg["instruction"], msg.get("input"), bool(msg.get("json")))
+                value = await self._while_alive(self._bridge.llm(msg["instruction"], msg.get("input"), bool(msg.get("json"))))
             else:
                 raise WorkerError(f"无效的请求: {kind!r}")
             reply: dict[str, Any] = {"op": "reply", "id": call_id, "ok": True, "value": to_jsonable(value)}
@@ -458,6 +458,35 @@ class ProcessSession:
         except ProtocolError:  # 输出超过帧上限：告诉脚本这次调用失败，而不是让整个执行崩溃
             reply = self._err(call_id, "tool_error", f"{kind} 的输出过大（上限 {MAX_FRAME} 字节）")
         await self._w.send(reply)
+
+    async def _while_alive(self, coro: Any) -> Any:
+        """
+        代办一次调用，同时监视 worker。
+
+        协议是一问一答：worker 发出请求后就阻塞在等回复，这期间从它那里收到任何东西
+        （退出、协议错误、多余的消息）都说明这次执行已经失败。不监视的话，worker 在 ask_user
+        等待期间被杀（这段时间不计入步骤超时），宿主会一直替一个已经死掉的执行等用户回答。
+        """
+        call = asyncio.ensure_future(coro)
+        watch = asyncio.ensure_future(self._w.recv())
+        try:
+            await asyncio.wait({call, watch}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            call.cancel()
+            watch.cancel()
+            raise
+        if not watch.done():
+            watch.cancel()
+            return call.result()  # 代办的异常原样抛出，由 _serve 转成给脚本的错误回复
+        # worker 先出事：放弃这次代办（包括正在等待的 ask_user）
+        call.cancel()
+        await asyncio.wait({call})
+        if not call.cancelled():
+            call.exception()  # 取走结果，避免“exception was never retrieved”
+        exc = watch.exception()
+        if exc is not None:
+            raise exc if isinstance(exc, WorkerError) else WorkerError(str(exc))
+        raise WorkerError(f"worker 在等待回复期间发来了意外的消息 {watch.result().get('op')!r}")
 
     @staticmethod
     def _err(call_id: Any, kind: str, e: Any) -> dict[str, Any]:
