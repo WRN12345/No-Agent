@@ -46,6 +46,14 @@ class Review(BaseModel):
     comment: str = ""
 
 
+class Permissions(BaseModel):
+    """技能声明自己会用到什么（共享技能的安全边界，后续阶段据此做强制检查）"""
+
+    tools: list[str] = []  # 用到的工具；空表示未声明
+    domains: list[str] = []  # 会访问的域名
+    skills: list[str] = []  # 会通过 ctx.skill() 调用的其他技能（声明了 tools 时必须声明）
+
+
 class VersionInfo(BaseModel):
     version: int
     created_at: datetime = Field(default_factory=_now)
@@ -57,6 +65,10 @@ class VersionInfo(BaseModel):
     status: Literal["candidate", "active", "superseded", "rejected", "pending_review"] = "active"
     note: str = ""
     review: Review | None = None
+    # 这个版本转正时才应用到技能上的参数 schema / 权限（指南型升级为脚本时用）。
+    # 在影子运行 / 等待审查期间不改动技能本身，被淘汰或拒绝时也就不需要回滚
+    params_schema: dict[str, Any] | None = None
+    permissions: Permissions | None = None
 
 
 class ShadowRecord(BaseModel):
@@ -131,14 +143,6 @@ def validate_params(schema: dict[str, Any], params: dict[str, Any]) -> list[str]
     return errors
 
 
-class Permissions(BaseModel):
-    """技能声明自己会用到什么（共享技能的安全边界，后续阶段据此做强制检查）"""
-
-    tools: list[str] = []  # 用到的工具；空表示未声明
-    domains: list[str] = []  # 会访问的域名
-    skills: list[str] = []  # 会通过 ctx.skill() 调用的其他技能（声明了 tools 时必须声明）
-
-
 class Skill(BaseModel):
     """
     一个技能 = 一个 SKILL.md 目录：
@@ -179,6 +183,26 @@ class Skill(BaseModel):
     def pending_review(self) -> VersionInfo | None:
         """等待审查的版本（同一时刻最多一个）"""
         return next((v for v in self.versions if v.status == "pending_review"), None)
+
+    def version_info(self, version: int | None) -> VersionInfo | None:
+        return next((v for v in self.versions if v.version == version), None)
+
+    def permissions_for(self, version: int | None) -> Permissions:
+        """执行某个版本时生效的权限：版本自带的（尚未转正的升级候选）优先"""
+        info = self.version_info(version)
+        return info.permissions if info and info.permissions is not None else self.permissions
+
+    def params_schema_for(self, version: int | None) -> dict[str, Any]:
+        info = self.version_info(version)
+        return info.params_schema if info and info.params_schema is not None else self.params_schema
+
+    @property
+    def awaiting_shadow_match(self) -> bool:
+        """
+        候选版本只能靠"匹配到同类任务"来影子运行：新提炼的技能（status=shadow），
+        以及已下线、但还带着候选版本的技能（例如人工批准了一个已下线技能的修补）——候选通过后重新上线
+        """
+        return self.shadow is not None and self.status in ("shadow", "retired")
 
     @property
     def kind(self) -> Literal["flow", "guide"]:

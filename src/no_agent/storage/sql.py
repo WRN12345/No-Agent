@@ -27,7 +27,8 @@ class Run(SQLModel, table=True):
 
     id: str = Field(default_factory=lambda: uuid4().hex, primary_key=True)
     task: str = Field(sa_column=Column(Text, nullable=False))
-    # skill：脚本独立完成 | skill_takeover：脚本失败、AI 接管 | freeform：AI 自己完成
+    # skill：脚本独立完成 | skill_takeover：脚本失败、AI 接管 | freeform：AI 自己完成 | guide：AI 照着指南完成
+    # aborted：用户取消 | error：意外错误（如 LLM 调用失败）
     mode: str = Field(index=True)
     skill_id: str | None = Field(default=None, index=True)
     skill_version: int | None = None

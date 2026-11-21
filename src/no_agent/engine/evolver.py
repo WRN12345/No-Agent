@@ -281,7 +281,8 @@ class Evolver:
             new_case = TestCase(task=run.task, params=params, fixtures=trace.get("fixtures", []), source_run_id=run.id)
             # 当前版本 / 候选版本可能已经能处理这种情况了
             if (await self._test(source, [new_case], skill.permissions)).passed:
-                self.store.add_test(skill, new_case, self.s.max_test_cases)
+                if (fresh := self.store.get(skill.id)) is not None:  # 测试期间技能可能已被重新加载
+                    self.store.add_test(fresh, new_case, self.s.max_test_cases)
                 which = "候选版本" if skill.shadow else "当前版本"
                 return {"status": "skipped", "skill_id": skill.id, "reason": f"{which}已能通过该用例"}
 
@@ -472,18 +473,22 @@ class Evolver:
             "upgrade", syn["script"], trace_tools=trace_tools(syn["used"]), declared_tools=skill.permissions.tools,
             atoms={sid: src for sid, (_, src) in syn["atoms"].items()},
         )
+        # 提炼期间（多次 await）技能可能已被修改或重新加载：基于最新的对象写入，不写回旧对象
+        skill = self.store.get(skill_id)
+        if skill is None or skill.kind != "guide" or skill.shadow or skill.pending_review:
+            return {"status": "skipped", "skill_id": skill_id, "reason": "提炼期间技能已变化"}
         atoms = self._create_atoms(syn["atoms"], parent=skill_id if review else None)
         if review:
             review.atoms = atoms
         learned: Skill = syn["skill"]
-        skill.params_schema = learned.params_schema  # 指南型原本没有参数；转正前不影响按指南执行
-        skill.permissions = learned.permissions
+        # 参数 schema 和权限记在候选版本上，转正时才应用：
+        # 指南型原本没有参数，提前改会让它在匹配时因"缺少必填参数"而不再命中；被审查拒绝 / 影子淘汰时也不用回滚
         skill.keywords = sorted(set(skill.keywords) | set(learned.keywords))
-        skill.tests = syn["cases"]
+        skill.tests = syn["cases"]  # 只供流程脚本使用；指南型执行不读取
         self.store.save(skill)
         skill = self.store.add_version(
             skill_id, syn["script"], reason=f"从 {len(syn['used'])} 次指南执行中提炼", pass_rate=syn["pass_rate"],
-            activate=not self._use_shadow, review=review,
+            activate=not self._use_shadow, review=review, params_schema=learned.params_schema, permissions=learned.permissions,
         )
         if review:
             self._mark(syn["used"], skill_id)
@@ -622,7 +627,8 @@ class Evolver:
             return {"status": "skipped", "reason": "真实运行未成功，无法比对"}
         params = (run.trace.get("match") or {}).get("params", {})
         if run.mode == "guide":  # 指南型执行时没有参数，按候选脚本的参数 schema 抽取
-            m = await self.matcher.match(run.task, only=[skill])
+            card = skill.model_copy(update={"params_schema": skill.params_schema_for(skill.shadow.version)})
+            m = await self.matcher.match(run.task, only=[card])
             if m is None:
                 return {"status": "skipped", "skill_id": skill.id, "reason": "无法为候选脚本抽取参数"}
             params = m.params
@@ -635,7 +641,7 @@ class Evolver:
         """新提炼的技能还在影子期：看这次运行的任务是否属于它，属于就影子跑一遍"""
         if not run.success:
             return {"status": "skipped", "reason": "真实运行未成功"}
-        shadows = [s for s in self.store.list(include_retired=True) if s.status == "shadow" and s.shadow]
+        shadows = [s for s in self.store.list(include_retired=True) if s.awaiting_shadow_match]
         if not getattr(runner_for(self.s), "sandboxed", False):  # 不可信的共享技能只能在 sandbox 档下执行
             shadows = [s for s in shadows if s.id not in getattr(self.store, "untrusted", ())]
         cands = [s for s, _ in await self.matcher.candidates(run.task, shadows)]
@@ -652,7 +658,8 @@ class Evolver:
         if skill.id in getattr(self.store, "untrusted", ()) and not getattr(runner, "sandboxed", False):
             raise RuntimeError(f"拒绝在 sandbox 档之外执行不可信的共享技能 {skill.id}")
         toolbox = ReplayToolbox(self.registry, run.trace.get("fixtures", []), timeout=self.s.tool_timeout)
-        toolbox.restrict(skill.permissions.tools, skill.permissions.domains)
+        perms = skill.permissions_for(version)  # 指南升级的候选带着自己的权限
+        toolbox.restrict(perms.tools, perms.domains)
         return await execute_script(
             self.store.script(skill.id, version),
             task=run.task,
@@ -661,7 +668,7 @@ class Evolver:
             llm=self.llms.fast,
             step_timeout=self.s.step_timeout,
             skills=self._caller(stack=(skill.id,)),
-            skill_allowlist=skill.permissions.skills,
+            skill_allowlist=perms.skills,
             runner=runner,
             budget=Budget.from_config(self.s),
         )
@@ -686,8 +693,12 @@ class Evolver:
         return bool(out.get("same")), str(out.get("reason", ""))
 
     def _record_shadow(self, skill: Skill, run: Run, agree: bool, reason: str) -> dict[str, Any]:
+        # 影子运行期间（多次 await）技能可能已被修改或重新加载：在最新的对象上记录，不写回旧对象
+        version = skill.shadow.version if skill.shadow else None
+        skill = self.store.get(skill.id)  # type: ignore[assignment]
+        if skill is None or skill.shadow is None or skill.shadow.version != version:
+            return {"status": "skipped", "reason": "影子运行期间候选版本已变化"}
         st = skill.shadow
-        assert st is not None
         st.log = (st.log + [ShadowRecord(run_id=run.id, agree=agree, reason=reason[:300])])[-20:]
         if agree:
             st.passes += 1

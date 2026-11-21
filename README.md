@@ -51,7 +51,7 @@ agent = Agent(
 
 async with agent:                                  # 启动后台进化器；退出时等待进化任务完成
     run = await agent.run("查一下所有待发货的订单")
-    print(run.mode, run.result)                    # mode: skill / skill_takeover / guide / freeform / aborted
+    print(run.mode, run.result)                    # mode: skill / skill_takeover / guide / freeform / aborted / error
 
 run = agent.run_sync("查一下所有待发货的订单")      # 同步代码中使用
 ```
@@ -324,6 +324,8 @@ uvicorn no_agent.server:app
 docker compose up                  # 见 docker-compose.yml，数据在 /data 卷中
 ```
 
+**鉴权**：独立运行时，设置了 `NO_AGENT_API_TOKEN` 则所有 `/api/v1` 接口要求 `Authorization: Bearer <token>`；没有设置时只接受本机（回环地址）请求。Docker 等对外暴露端口的部署必须设置 token。`/health` 不需要鉴权。挂到已有应用时 `create_router(agent)` 默认不做鉴权（由宿主应用负责），也可以传 `create_router(agent, api_token=...)`。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/v1/run` | 执行任务；`mode=freeform` 强制 AI 做，`mode=skill` + `skill_id` 指定技能 |
@@ -376,7 +378,8 @@ docker compose up                  # 见 docker-compose.yml，数据在 /data �
 - **混合脚本**：确定的部分写成代码，需要理解的部分用 `ctx.llm()` 调小模型。
 - **技能组合**：`ctx.skill()` 调用子技能，子技能在自己的权限下运行；原子技能是不参与整任务匹配的积木
 - **共享即代码**：共享技能按签名决定信任，未签名的流程型技能先影子运行，未签名的指南型技能不自动使用
-- **自动下线**：当前版本最近 `retire_window` 次中脚本独立成功率低于阈值 → `retired`；可回滚 / 重新启用。
+- **自动下线**：当前版本最近 `retire_window` 次中脚本独立成功率低于阈值 → `retired`；可回滚 / 重新启用。有修补候选正在影子运行时暂不下线，等候选转正或被淘汰；手动下线会一并淘汰候选版本。
+- **出错时**：脚本 worker 无法启动（环境问题）→ 降级为 AI 自由执行，不计入技能统计、不触发进化；其他意外错误（如 LLM 调用失败）→ 留下一条 `mode="error"` 的运行记录，异常照常抛出。
 
 ## 已知限制 / 后续方向
 

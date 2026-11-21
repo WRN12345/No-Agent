@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hmac
+import ipaddress
 from typing import Any, Callable
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from no_agent.agent import Agent
 from no_agent.engine.evolver import Job
@@ -21,9 +23,42 @@ from no_agent.server.schemas import (
 from no_agent.skills.models import Skill
 
 
-def create_router(agent: Agent | Callable[[], Agent]) -> APIRouter:
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def make_auth(api_token: str | None, *, local_only: bool = False) -> Callable[[Request], None]:
+    """
+    鉴权依赖：
+      api_token 非空 → 要求 Authorization: Bearer <api_token>
+      否则 local_only=True → 只接受本机（回环地址）请求
+    """
+
+    def check(request: Request) -> None:
+        if api_token:
+            scheme, _, value = request.headers.get("authorization", "").partition(" ")
+            if scheme.lower() != "bearer" or not hmac.compare_digest(value.strip().encode(), api_token.encode()):
+                raise HTTPException(401, "需要有效的 API token（Authorization: Bearer <token>）", headers={"WWW-Authenticate": "Bearer"})
+        elif local_only:
+            host = request.client.host if request.client else ""
+            if not _is_loopback(host):
+                raise HTTPException(403, "未设置 NO_AGENT_API_TOKEN 时只接受本机请求；对外提供服务请设置 token")
+
+    return check
+
+
+def create_router(agent: Agent | Callable[[], Agent], *, api_token: str | None = None) -> APIRouter:
+    """
+    api_token：给定时，所有接口都要求 Authorization: Bearer <api_token>。
+    不给时不做鉴权——挂到已有应用上时，由宿主应用负责（例如 include_router(..., dependencies=[...])）
+    """
     get_agent: Callable[[], Agent] = agent if callable(agent) and not isinstance(agent, Agent) else (lambda: agent)  # type: ignore[assignment,return-value]
-    router = APIRouter()
+    router = APIRouter(dependencies=[Depends(make_auth(api_token))] if api_token else [])
 
     def _summary(a: Agent, s: Skill) -> SkillSummary:
         st = s.stats

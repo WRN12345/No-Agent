@@ -29,6 +29,7 @@ from no_agent.skills.compose import SkillCaller
 from no_agent.skills.matcher import MatchResult, SkillMatcher
 from no_agent.skills.models import Skill, validate_params
 from no_agent.skills.runner import Budget, runner_for
+from no_agent.skills.process import WorkerStartError
 from no_agent.skills.runtime import ExecutionResult, execute_script
 from no_agent.skills.script import function_source
 from no_agent.tools.base import Toolbox, ToolRegistry, UserAbort
@@ -78,56 +79,69 @@ class EvolvingAgent:
             match = await self._select(task, mode, skill_id, params)
             exe: ExecutionResult | None = None
             ff: FreeformResult | None = None
-
-            if match:
-                trace["match"] = {
-                    "kind": match.skill.kind,
-                    "skill_id": match.skill.id,
-                    "version": match.skill.active_version,
-                    "params": match.params,
-                    "confidence": match.confidence,
-                    "reason": match.reason,
-                }
-            if match and match.skill.kind == "guide":
-                # 指南型技能：没有脚本，把 SKILL.md 正文交给 AI 照着做
-                ff, abort = await self._freeform(task, toolbox, None, guide=match.skill)
-            elif match:
-                source = self.store.script(match.skill.id)
-                perms = match.skill.permissions
-                toolbox.restrict(perms.tools, perms.domains)  # 脚本只能用声明过的工具 / 域名
-                try:
-                    exe = await execute_script(
-                        source, task=task, params=match.params, toolbox=toolbox, llm=self.llms.fast,
-                        step_timeout=self.s.step_timeout,
-                        skills=SkillCaller(self.store, self.llms.fast, step_timeout=self.s.step_timeout, stack=(match.skill.id,)),
-                        skill_allowlist=perms.skills, runner=self.runner, budget=Budget.from_config(self.s),
-                    )
-                finally:
-                    toolbox.restrict(None, None)  # AI 接管不受技能权限限制
-                trace["execution"] = exe.summary()
-                if exe.aborted:
-                    abort = exe.error
-                elif not exe.success:
-                    if exe.guard_rejected:
-                        logger.info("技能 %s 前置检查未通过: %s → AI 接管（未执行任何步骤）", match.skill.id, exe.error)
-                    else:
-                        logger.info("技能 %s 在 %s 失败: %s → AI 接管", match.skill.id, exe.failed_step, exe.error)
-                    trace["state_at_failure"] = exe.state
-                    takeover = TakeoverContext(
-                        skill_id=match.skill.id,
-                        version=match.skill.active_version,
-                        all_steps=exe.all_steps,
-                        done_steps=[s.name for s in exe.steps if s.ok],
-                        failed_step=exe.failed_step or "",
-                        error=exe.error or "",
-                        failed_source=function_source(source, "guard" if exe.guard_rejected else exe.failed_step or "") or "",
-                        params=match.params,
-                        state=exe.state,
-                        side_effects=toolbox.side_effect_calls(),
-                    )
-                    ff, abort = await self._freeform(task, toolbox, takeover)
-            else:
-                ff, abort = await self._freeform(task, toolbox, None)
+            degraded = False  # 脚本执行环境出了问题（不是脚本的错），已降级为 AI 自由执行
+            try:
+                if match:
+                    trace["match"] = {
+                        "kind": match.skill.kind,
+                        "skill_id": match.skill.id,
+                        "version": match.skill.active_version,
+                        "params": match.params,
+                        "confidence": match.confidence,
+                        "reason": match.reason,
+                    }
+                if match and match.skill.kind == "guide":
+                    # 指南型技能：没有脚本，把 SKILL.md 正文交给 AI 照着做
+                    ff, abort = await self._freeform(task, toolbox, None, guide=match.skill)
+                elif match:
+                    source = self.store.script(match.skill.id)
+                    perms = match.skill.permissions
+                    toolbox.restrict(perms.tools, perms.domains)  # 脚本只能用声明过的工具 / 域名
+                    try:
+                        exe = await execute_script(
+                            source, task=task, params=match.params, toolbox=toolbox, llm=self.llms.fast,
+                            step_timeout=self.s.step_timeout,
+                            skills=SkillCaller(self.store, self.llms.fast, step_timeout=self.s.step_timeout, stack=(match.skill.id,)),
+                            skill_allowlist=perms.skills, runner=self.runner, budget=Budget.from_config(self.s),
+                        )
+                    except WorkerStartError as e:
+                        # 脚本 worker 起不来是环境问题：不算脚本失败，不接管、不修补，降级为 AI 自由执行
+                        logger.error("技能 %s 无法执行（%s），降级为 AI 自由执行", match.skill.id, e)
+                        trace["execution_error"] = str(e)
+                        degraded = True
+                    finally:
+                        toolbox.restrict(None, None)  # AI 接管不受技能权限限制
+                    if exe is not None:
+                        trace["execution"] = exe.summary()
+                    if exe is None:  # 降级
+                        ff, abort = await self._freeform(task, toolbox, None)
+                    elif exe.aborted:
+                        abort = exe.error
+                    elif not exe.success:
+                        if exe.guard_rejected:
+                            logger.info("技能 %s 前置检查未通过: %s → AI 接管（未执行任何步骤）", match.skill.id, exe.error)
+                        else:
+                            logger.info("技能 %s 在 %s 失败: %s → AI 接管", match.skill.id, exe.failed_step, exe.error)
+                        trace["state_at_failure"] = exe.state
+                        takeover = TakeoverContext(
+                            skill_id=match.skill.id,
+                            version=match.skill.active_version,
+                            all_steps=exe.all_steps,
+                            done_steps=[s.name for s in exe.steps if s.ok],
+                            failed_step=exe.failed_step or "",
+                            error=exe.error or "",
+                            failed_source=function_source(source, "guard" if exe.guard_rejected else exe.failed_step or "") or "",
+                            params=match.params,
+                            state=exe.state,
+                            side_effects=toolbox.side_effect_calls(),
+                        )
+                        ff, abort = await self._freeform(task, toolbox, takeover)
+                else:
+                    ff, abort = await self._freeform(task, toolbox, None)
+            except Exception as e:
+                # 意外错误（LLM 调用失败等）：留下运行记录便于排查，再原样抛出
+                self._save_error(task, match, toolbox, trace, meter, t0, e)
+                raise
 
         if abort:
             # 用户取消：不是脚本或 AI 的错，不计入统计、不触发进化
@@ -137,7 +151,10 @@ class EvolvingAgent:
             run_mode, success, result, error = "skill", True, exe.result, None
         else:
             assert ff is not None
-            run_mode = ("guide" if match.skill.kind == "guide" else "skill_takeover") if match else "freeform"
+            if degraded:
+                run_mode = "freeform"
+            else:
+                run_mode = ("guide" if match.skill.kind == "guide" else "skill_takeover") if match else "freeform"
             success, result = ff.success, ff.result
             error = ff.error or (None if ff.success else "未完成")
             trace["freeform"] = {"summary": ff.summary, "turns": ff.turns}
@@ -164,7 +181,7 @@ class EvolvingAgent:
             )
         )
 
-        if abort:
+        if abort or degraded:  # 用户取消 / 执行环境故障：不计入统计、不触发进化
             return run
         self._submit_shadow(run, match)
         if match:
@@ -178,6 +195,34 @@ class EvolvingAgent:
             self.evolver.submit(Job("distill", run.id))
         return run
 
+    def _save_error(
+        self, task: str, match: MatchResult | None, toolbox: Toolbox, trace: dict[str, Any], meter: Any, t0: float, e: Exception
+    ) -> None:
+        trace = {
+            **trace,
+            "exception": f"{type(e).__name__}: {e}",
+            "tool_calls": [c.to_trace() for c in toolbox.calls],
+            "usage": meter.to_dict(),
+        }
+        try:
+            self.runs.save(
+                Run(
+                    task=task,
+                    mode="error",
+                    skill_id=match.skill.id if match else None,
+                    skill_version=match.skill.active_version if match else None,
+                    success=False,
+                    error=f"内部错误: {type(e).__name__}: {e}",
+                    trace_json=json.dumps(trace, ensure_ascii=False, default=str),
+                    tool_call_count=len(toolbox.calls),
+                    prompt_tokens=meter.prompt_tokens,
+                    completion_tokens=meter.completion_tokens,
+                    latency_ms=int((time.perf_counter() - t0) * 1000),
+                )
+            )
+        except Exception:  # noqa: BLE001 - 记录失败不能掩盖原始异常
+            logger.exception("保存错误运行记录失败")
+
     def _submit_shadow(self, run: Run, match: MatchResult | None) -> None:
         """真实运行成功后，让候选版本 / 影子技能在后台用这次的录制数据跑一遍，用于比对转正"""
         if not run.success:
@@ -186,7 +231,7 @@ class EvolvingAgent:
             skill = self.store.get(match.skill.id)
             if skill and skill.shadow:
                 self.evolver.submit(Job("shadow", run.id, skill_id=skill.id, version=skill.shadow.version))
-        elif any(s.status == "shadow" for s in self.store.list(include_retired=True)):
+        elif any(s.awaiting_shadow_match for s in self.store.list(include_retired=True)):
             self.evolver.submit(Job("shadow_match", run.id))
 
     async def _select(self, task: str, mode: RunMode, skill_id: str | None, params: dict | None) -> MatchResult | None:
@@ -249,7 +294,13 @@ class EvolvingAgent:
             window=self.s.retire_window,
         )
         rate = skill.stats.recent_success_rate
-        if len(skill.stats.recent) >= self.s.retire_window and rate is not None and rate < self.s.retire_min_success_rate:
+        low = len(skill.stats.recent) >= self.s.retire_window and rate is not None and rate < self.s.retire_min_success_rate
+        if low and skill.shadow is not None:
+            # 修好的候选版本正在影子运行：先不下线（接管保证了这期间任务照样完成），等候选转正或被淘汰。
+            # 否则技能下线后不再被匹配，候选版本就再也得不到影子运行，永远转不了正
+            logger.info("技能 %s 最近成功率 %.0f%%，但候选 v%d 正在影子运行，暂不下线", skill.id, rate * 100, skill.shadow.version)
+            self.store.save_stats(skill)
+        elif low:
             skill.status = "retired"
             logger.warning("技能 %s 最近成功率 %.0f%%，自动下线", skill.id, rate * 100)
             self.store.save(skill)

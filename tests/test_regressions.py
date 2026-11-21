@@ -185,3 +185,209 @@ async def test_nudge_then_finish_succeeds(tmp_path, fast, strong, web):
     async with _make_agent(tmp_path, fast, strong, web) as agent:
         run = await agent.run("抓一下 http://a.test/")
         assert run.success and run.result == "A"
+
+
+# ── 指南升级：参数 / 权限在转正时才应用 ──
+
+URL = {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}
+GUIDE_MD = """---
+name: page-body
+description: 获取网页正文
+---
+
+# 获取网页正文
+
+用 fetch_page 打开网址。
+"""
+
+
+def _install_guide(agent: Agent, tmp_path) -> None:
+    d = tmp_path / "dl" / "page-body"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(GUIDE_MD, encoding="utf-8")
+    agent.install_skill(d)
+
+
+def test_upgrade_candidate_does_not_change_skill_until_promoted(tmp_path, fast, strong, web):
+    from no_agent.skills.models import Permissions
+
+    agent = _make_agent(tmp_path, fast, strong, web)
+    _install_guide(agent, tmp_path)
+    store = agent.store
+    perms = Permissions(tools=["fetch_page"])
+
+    s = store.add_version("page-body", SCRIPT, reason="升级", pass_rate=1.0, activate=False, params_schema=URL, permissions=perms)
+    assert s.kind == "guide" and s.shadow_version == 1
+    assert s.params_schema.get("required") is None and s.permissions.tools == []  # 技能本身没变
+    assert s.params_schema_for(1) == URL and s.permissions_for(1).tools == ["fetch_page"]  # 候选带着自己的
+
+    s = store.reject_shadow("page-body", "不一致")  # 被淘汰：无需回滚
+    assert s.kind == "guide" and s.params_schema.get("required") is None and s.permissions.tools == []
+
+    store.add_version("page-body", SCRIPT, reason="再升级", pass_rate=1.0, activate=False, params_schema=URL, permissions=perms)
+    s = store.promote("page-body")  # 转正：这时才应用
+    assert s.kind == "flow" and s.params_schema == URL and s.permissions.tools == ["fetch_page"]
+    store.reload()  # 落盘后也一样
+    s = store.get("page-body")
+    assert s.params_schema == URL and s.permissions.tools == ["fetch_page"]
+
+
+def test_rejected_upgrade_review_leaves_skill_untouched(tmp_path, fast, strong, web):
+    from no_agent.skills.models import Permissions, Review
+
+    agent = _make_agent(tmp_path, fast, strong, web)
+    _install_guide(agent, tmp_path)
+    review = Review(kind="upgrade", reasons=["新增工具: fetch_page"])
+    agent.store.add_version(
+        "page-body", SCRIPT, reason="升级", pass_rate=1.0, activate=False, review=review,
+        params_schema=URL, permissions=Permissions(tools=["fetch_page"]),
+    )
+    s = agent.store.reject_review("page-body", 1, "不需要")
+    assert s.kind == "guide" and s.params_schema.get("required") is None and s.permissions.tools == []
+
+
+# ── 下线与候选版本 ──
+
+
+def _flow_with_candidate(agent: Agent) -> Skill:
+    _create_skill(agent)
+    return agent.store.add_version("fetch-body", SCRIPT, reason="修补", pass_rate=1.0, activate=False)
+
+
+def _fill_failures(agent: Agent, skill: Skill) -> None:
+    skill.stats.recent = [False] * agent.config.retire_window
+
+
+def test_no_auto_retire_while_candidate_in_shadow(tmp_path, fast, strong, web):
+    from no_agent.skills.matcher import MatchResult
+
+    agent = _make_agent(tmp_path, fast, strong, web)
+    skill = _flow_with_candidate(agent)
+    _fill_failures(agent, skill)
+    agent.engine._record_skill(MatchResult(skill=skill, params={}, confidence=1), None, True, 1)
+    assert agent.store.get("fetch-body").status == "active"  # 候选还在影子运行：先不下线
+
+    agent.store.reject_shadow("fetch-body", "不一致")
+    skill = agent.store.get("fetch-body")
+    _fill_failures(agent, skill)
+    agent.engine._record_skill(MatchResult(skill=skill, params={}, confidence=1), None, True, 1)
+    assert agent.store.get("fetch-body").status == "retired"  # 没有候选了：照常下线
+
+
+def test_retired_skill_with_candidate_still_gets_shadow_runs(tmp_path, fast, strong, web):
+    agent = _make_agent(tmp_path, fast, strong, web)
+    skill = _flow_with_candidate(agent)
+    skill.status = "retired"
+    agent.store.save(skill)
+    s = agent.store.get("fetch-body")
+    assert s.awaiting_shadow_match  # 不会被匹配，但候选仍会在同类任务上影子运行，通过后重新上线
+    assert agent.store.promote("fetch-body").status == "active"
+
+
+def test_manual_retire_drops_candidate(tmp_path, fast, strong, web):
+    agent = _make_agent(tmp_path, fast, strong, web)
+    _flow_with_candidate(agent)
+    s = agent.store.set_status("fetch-body", "retired")
+    assert s.shadow is None and not s.awaiting_shadow_match
+    assert s.version_info(2).status == "rejected" and "手动下线" in s.version_info(2).note
+
+
+# ── 主流程的异常处理 ──
+
+
+async def test_worker_start_failure_degrades_to_freeform(tmp_path, fast, strong, web):
+    from no_agent.skills.process import WorkerStartError
+
+    class BrokenRunner:
+        async def open(self, *a, **k):
+            raise WorkerStartError("无法启动脚本 worker: 测试")
+
+    web.pages["http://a.test/"] = "hello"
+    strong.on("freeform", _fetch_then(lambda m: tool_reply("finish", {"success": True, "result": {"body": "hello"}})))
+    async with _make_agent(tmp_path, fast, strong, web) as agent:
+        _create_skill(agent)
+        agent.engine.runner = BrokenRunner()
+        run = await agent.skill("fetch-body").run({"url": "http://a.test/"})
+        assert run.success and run.mode == "freeform" and "测试" in run.trace["execution_error"]
+        assert "takeover" not in strong.calls  # 不是脚本的错：不接管
+        assert agent.store.get("fetch-body").stats.runs == 0  # 不计入技能统计
+        assert agent.evolver.queue.qsize() == 0 and len(agent.evolver.history) == 0  # 不修补、不提炼
+
+
+async def test_unexpected_error_is_recorded_and_reraised(tmp_path, fast, strong, web):
+    def boom(messages, tools):
+        raise RuntimeError("LLM 服务不可用")
+
+    strong.on("freeform", boom)
+    async with _make_agent(tmp_path, fast, strong, web) as agent:
+        with pytest.raises(RuntimeError, match="LLM 服务不可用"):
+            await agent.run("随便做点什么")
+        [run] = agent.runs.list()
+        assert run.mode == "error" and not run.success and "LLM 服务不可用" in run.error
+        assert agent.evolver.queue.qsize() == 0
+
+
+# ── HTTP 鉴权 ──
+
+
+def test_http_requires_token_when_configured(tmp_path, fast, strong, web):
+    from fastapi.testclient import TestClient
+
+    from no_agent.server import create_app
+
+    agent = _make_agent(tmp_path, fast, strong, web)
+    with TestClient(create_app(agent, api_token="s3cret")) as client:
+        assert client.get("/health").status_code == 200  # 健康检查不需要鉴权
+        assert client.get("/api/v1/tools").status_code == 401
+        assert client.get("/api/v1/tools", headers={"Authorization": "Bearer wrong"}).status_code == 401
+        assert client.get("/api/v1/tools", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+
+
+def test_http_without_token_only_accepts_local(tmp_path, fast, strong, web, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from no_agent.server import create_app
+
+    monkeypatch.delenv("NO_AGENT_API_TOKEN", raising=False)
+    agent = _make_agent(tmp_path, fast, strong, web)
+    with TestClient(create_app(agent), client=("10.0.0.8", 5000)) as client:
+        r = client.get("/api/v1/tools")
+        assert r.status_code == 403 and "NO_AGENT_API_TOKEN" in r.json()["detail"]
+    with TestClient(create_app(agent), client=("::1", 5000)) as client:
+        assert client.get("/api/v1/tools").status_code == 200
+
+
+def test_router_token(tmp_path, fast, strong, web):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from no_agent.server import create_router
+
+    app = FastAPI()
+    app.include_router(create_router(_make_agent(tmp_path, fast, strong, web), api_token="t"), prefix="/x")
+    with TestClient(app) as client:
+        assert client.get("/x/tools").status_code == 401
+        assert client.get("/x/tools", headers={"Authorization": "bearer t"}).status_code == 200
+
+
+# ── 进化器不写回旧对象 ──
+
+
+def test_record_shadow_uses_fresh_skill(tmp_path, fast, strong, web):
+    from no_agent.storage.sql import Run
+
+    agent = _make_agent(tmp_path, fast, strong, web)
+    agent.config.shadow_min_runs = 3  # 一次通过不够转正，才能看到记录落在哪个对象上
+    stale = _flow_with_candidate(agent)
+    agent.store.reload()  # 影子运行期间技能被重新加载（例如 install / sync）
+    run = Run(task="t", mode="skill", success=True)
+
+    out = agent.evolver._record_shadow(stale, run, True, "一致")
+    assert out["status"] == "shadow_pass"
+    assert agent.store.get("fetch-body").shadow.passes == 1  # 记在最新的对象上
+
+    agent.store.reject_shadow("fetch-body", "x")
+    agent.store.add_version("fetch-body", SCRIPT, reason="新候选", pass_rate=1.0, activate=False)
+    out = agent.evolver._record_shadow(stale, run, True, "一致")  # stale 还指着旧候选 v2
+    assert out["status"] == "skipped"
+    assert agent.store.get("fetch-body").shadow.passes == 0

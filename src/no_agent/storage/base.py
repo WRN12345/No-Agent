@@ -10,10 +10,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from no_agent.skills.models import Review, Skill, TestCase
+    from no_agent.skills.models import Permissions, Review, Skill, TestCase
     from no_agent.storage.sql import Run
 
 # 存储结构版本：变更结构时 +1 并提供迁移
@@ -38,7 +38,7 @@ class SkillStore(Protocol):
     ) -> Skill: ...
     def add_version(
         self, skill_id: str, script: str, *, reason: str, pass_rate: float | None, activate: bool = True,
-        review: Review | None = None,
+        review: Review | None = None, params_schema: dict[str, Any] | None = None, permissions: Permissions | None = None,
     ) -> Skill: ...
     def approve_review(self, skill_id: str, version: int, *, shadow: bool, comment: str = "") -> Skill: ...
     def reject_review(self, skill_id: str, version: int, reason: str = "审查未通过") -> Skill: ...

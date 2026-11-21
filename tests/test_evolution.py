@@ -188,7 +188,7 @@ async def test_no_candidates_skips_match_llm(agent, fast, strong, web):
 def test_api(agent, strong, web):
     web.pages = {"http://site/1": "<title>X</title>"}
     setup_freeform(strong)
-    with TestClient(create_app(agent)) as client:
+    with TestClient(create_app(agent), client=("127.0.0.1", 50000)) as client:
         assert client.get("/health").json()["status"] == "ok"
         assert client.post("/api/v1/run", json={"task": ""}).status_code == 422
 

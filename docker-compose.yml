@@ -8,7 +8,7 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - .env
+      - .env  # 必须设置 NO_AGENT_API_TOKEN，否则容器外的请求一律被拒绝（只接受本机请求）
     volumes:
       - no-agent-data:/data  # 技能库与运行记录需要持久化
 

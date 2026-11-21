@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from no_agent.skills import skillmd
-from no_agent.skills.models import Review, ShadowState, Skill, SkillStats, TestCase, VersionInfo, _now
+from no_agent.skills.models import Permissions, Review, ShadowState, Skill, SkillStats, TestCase, VersionInfo, _now
 from no_agent.skills.script import ScriptError, script_tools, step_docs, validate_script
 from no_agent.storage.base import SKILL_SCHEMA_VERSION as SCHEMA_VERSION
 from no_agent.tools.base import ALWAYS_ALLOWED
@@ -279,11 +279,12 @@ class FileSkillStore:
 
     def add_version(
         self, skill_id: str, script: str, *, reason: str, pass_rate: float | None, activate: bool = True,
-        review: Review | None = None,
+        review: Review | None = None, params_schema: dict[str, Any] | None = None, permissions: Permissions | None = None,
     ) -> Skill:
         """
         新增版本。activate=True 直接上线；False 作为候选版本进入影子运行（替换掉之前的候选）。
         review 非空：扩大了能力，只保存、等人批准（approve_review），不影响当前版本和候选版本。
+        params_schema / permissions：这个版本转正时才应用到技能上（指南型升级为脚本时用）
         """
         with self._lock:
             skill = self._require(skill_id)
@@ -291,13 +292,16 @@ class FileSkillStore:
             v = max((x.version for x in skill.versions), default=0) + 1
             _write_atomic(d / script_relpath(v), script)
             parent = skill.shadow_version or skill.active_version or None
+            extra = {"params_schema": params_schema, "permissions": permissions}
             if review is not None:
                 skill.versions.append(
-                    VersionInfo(version=v, reason=reason, parent=parent, test_pass_rate=pass_rate, status="pending_review", review=review)
+                    VersionInfo(
+                        version=v, reason=reason, parent=parent, test_pass_rate=pass_rate, status="pending_review", review=review, **extra
+                    )
                 )
                 self.save(skill)
                 return skill
-            skill.versions.append(VersionInfo(version=v, reason=reason, parent=parent, test_pass_rate=pass_rate, status="candidate"))
+            skill.versions.append(VersionInfo(version=v, reason=reason, parent=parent, test_pass_rate=pass_rate, status="candidate", **extra))
             if skill.shadow:  # 被新的候选取代
                 self._version(skill, skill.shadow.version).status = "rejected"
                 self._version(skill, skill.shadow.version).note = f"被 v{v} 取代"
@@ -413,7 +417,13 @@ class FileSkillStore:
         for x in skill.versions:
             if x.status == "active" and x.version != version:
                 x.status = "superseded"
-        self._version(skill, version).status = "active"
+        info = self._version(skill, version)
+        info.status = "active"
+        # 版本自带的参数 / 权限（指南升级的候选）在转正时才生效
+        if info.params_schema is not None:
+            skill.params_schema, info.params_schema = info.params_schema, None
+        if info.permissions is not None:
+            skill.permissions, info.permissions = info.permissions, None
         skill.active_version = version
         if skill.shadow and skill.shadow.version == version:
             skill.shadow = None
@@ -438,6 +448,11 @@ class FileSkillStore:
     def set_status(self, skill_id: str, status: str) -> Skill:
         with self._lock:
             skill = self._require(skill_id)
+            if status == "retired" and skill.shadow is not None:
+                # 手动下线：一并淘汰候选版本，否则它会在影子运行通过后把技能重新上线
+                info = self._version(skill, skill.shadow.version)
+                info.status, info.note = "rejected", "技能已手动下线"
+                skill.shadow = None
             skill.status = status  # type: ignore[assignment]
             self.save(skill)
             return skill

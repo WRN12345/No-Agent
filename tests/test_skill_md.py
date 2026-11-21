@@ -173,7 +173,7 @@ def test_api_explicit_run_and_kind(agent, web, page_title, third_party):
 
     agent.install_skill(third_party)
     web.pages = {"http://site/1": "<title>API</title>"}
-    with TestClient(create_app(agent)) as client:
+    with TestClient(create_app(agent), client=("127.0.0.1", 50000)) as client:
         kinds = {s["id"]: (s["kind"], s["layer"]) for s in client.get("/api/v1/skills").json()}
         assert kinds == {"page-title": ("flow", "local"), "weekly-report": ("guide", "local")}
         r = client.post("/api/v1/skills/page-title/run", json={"params": {"url": "http://site/1"}})

@@ -269,7 +269,7 @@ def test_api_shadow_status_and_manual_promote(tmp_path, fast, strong, web):
     agent = make_agent(tmp_path, fast, strong, web)
     add_page_title(agent)
     agent.store.add_version("page-title", SKILL_V1 + "\n", reason="候选", pass_rate=1.0, activate=False)
-    with TestClient(create_app(agent)) as client:
+    with TestClient(create_app(agent), client=("127.0.0.1", 50000)) as client:
         s = client.get("/api/v1/skills").json()[0]
         assert (s["active_version"], s["shadow_version"], s["shadow_passes"]) == (1, 2, 0)
         assert client.post("/api/v1/skills/page-title/promote").json()["active_version"] == 2
