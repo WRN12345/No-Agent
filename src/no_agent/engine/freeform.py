@@ -45,6 +45,8 @@ FREEFORM_SYSTEM = """你是一个任务执行 Agent。通过调用工具完成�
 - 操作网页时先用 browser_snapshot 获取全部字段，再用 browser_fill 一次性批量填写，不要逐个字段操作
 - 无法完成时调用 finish 并设置 success=false，在 result 中说明原因"""
 
+NEED_FINISH = "请调用 finish 提交最终结果：完成了就 success=true 并给出 result；没能完成就 success=false 并在 result 中说明原因。"
+
 TAKEOVER_SYSTEM = """
 
 ## 接管说明
@@ -131,11 +133,23 @@ async def run_freeform(
     purpose = "takeover" if takeover else ("guide" if guide else "freeform")
     step_label = "takeover" if takeover else None
 
+    used_tools = False  # 本次是否调用过工具
+    nudged = False  # 是否已经提醒过要用 finish 提交
+
     for turn in range(1, max_turns + 1):
         reply = await llm.complete(messages, tools=tools, purpose=purpose)
         if not reply.tool_calls:
-            # 模型直接给出文本答案（纯问答类任务）
-            return FreeformResult(success=bool(reply.content.strip()), result=reply.content, turns=turn)
+            text = (reply.content or "").strip()
+            if not takeover and not used_tools:
+                # 纯问答类任务：模型直接给出文本答案
+                return FreeformResult(success=bool(text), result=reply.content, turns=turn)
+            # 接管或已经动过工具：只回一段文字不能算完成（可能是"我做不到"），要求用 finish 如实提交
+            if nudged:
+                return FreeformResult(success=False, result=reply.content, error="没有调用 finish 提交结果", turns=turn)
+            nudged = True
+            messages.append({"role": "assistant", "content": reply.content or ""})
+            messages.append({"role": "user", "content": NEED_FINISH})
+            continue
 
         messages.append(
             {
@@ -157,6 +171,7 @@ async def run_freeform(
                     error=None if a.get("success", True) else str(a.get("result")),
                     turns=turn,
                 )
+            used_tools = True
             try:
                 out = await toolbox.call(tc.name, tc.arguments, step=step_label)
                 content = json.dumps(truncate(out), ensure_ascii=False, default=str)

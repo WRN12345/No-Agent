@@ -207,9 +207,14 @@ class EvolvingAgent:
                 return MatchResult(skill=skill, params=params, confidence=1.0, reason="指定技能与参数")
             if skill.kind == "guide" or not skill.params_schema.get("properties"):
                 return MatchResult(skill=skill, params={}, confidence=1.0, reason="指定技能（无需参数）")
-            # 只指定技能：让小模型抽取参数
-            m = await self.matcher.match(task, only=[skill])
-            return m or MatchResult(skill=skill, params={}, confidence=0.0, reason="指定技能，未能抽取参数")
+            # 只指定技能：让小模型抽取参数（用户已经选定了技能，不再按置信度阈值过滤）。
+            # 抽取不出来就报错，不能带着空参数开跑——否则脚本失败后会被接管、修补，把错误的参数写进回归用例
+            m = await self.matcher.match(task, only=[skill], min_confidence=0.0)
+            if m is None:
+                raise ValueError(f"无法从任务中抽取技能 {skill.id} 的参数，请直接提供 params")
+            if errors := validate_params(skill.params_schema, m.params):
+                raise ValueError(f"从任务中抽取的技能 {skill.id} 参数不合法：" + "；".join(errors))
+            return m
         return await self.matcher.match(task)
 
     async def _freeform(

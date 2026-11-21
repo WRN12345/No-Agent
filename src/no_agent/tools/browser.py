@@ -258,6 +258,7 @@ async def _settle(page: Any) -> None:
 def make_browser_tools(session: BrowserSession) -> list[Tool]:
     @tool(
         "browser_open",
+        stateful=True,  # 依赖 / 改变当前页面：回放时只用录制结果
         url_arg="url",
         description="在浏览器中打开网址",
         parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
@@ -272,6 +273,7 @@ def make_browser_tools(session: BrowserSession) -> list[Tool]:
 
     @tool(
         "browser_snapshot",
+        stateful=True,  # 依赖 / 改变当前页面：回放时只用录制结果
         description=(
             "读取当前页面上所有可填写的字段和按钮（一次拿全）。每个字段包含 selector、label、type、required、"
             "options、当前 value；按钮包含 selector、text、submit（是否是提交按钮）。scope 可限定在某个容器内。"
@@ -287,6 +289,7 @@ def make_browser_tools(session: BrowserSession) -> list[Tool]:
 
     @tool(
         "browser_fill",
+        stateful=True,  # 依赖 / 改变当前页面：回放时只用录制结果
         description=(
             "批量填写表单字段：fields=[{selector, value}]。文本框直接填；下拉框 value 可以是选项值或选项文字；"
             "复选框用 true/false；单选组用选项值或选项文字。有字段填写失败时报错并列出失败的字段。"
@@ -339,6 +342,7 @@ def make_browser_tools(session: BrowserSession) -> list[Tool]:
 
     @tool(
         "browser_read",
+        stateful=True,  # 依赖 / 改变当前页面：回放时只用录制结果
         description="读取字段的当前值：selectors=[...]，返回 {selector: value}（下拉框返回 {value, label}）",
         parameters={
             "type": "object",
@@ -356,6 +360,7 @@ def make_browser_tools(session: BrowserSession) -> list[Tool]:
 
     @tool(
         "browser_click",
+        stateful=True,  # 依赖 / 改变当前页面：回放时只用录制结果
         description="点击普通按钮 / 链接（不能用于提交表单，提交请用 browser_submit）",
         parameters={"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]},
         side_effect=True,
@@ -374,6 +379,7 @@ def make_browser_tools(session: BrowserSession) -> list[Tool]:
 
     @tool(
         "browser_submit",
+        stateful=True,  # 依赖 / 改变当前页面：回放时只用录制结果
         description="点击提交按钮提交表单。执行前系统会自动请求用户确认；summary 是展示给用户确认的内容摘要（例如填了哪些值）",
         parameters={
             "type": "object",
@@ -397,6 +403,7 @@ def make_browser_tools(session: BrowserSession) -> list[Tool]:
 
     @tool(
         "browser_text",
+        stateful=True,  # 依赖 / 改变当前页面：回放时只用录制结果
         description="读取页面（或某个元素）的可见文字，用于确认结果",
         parameters={
             "type": "object",

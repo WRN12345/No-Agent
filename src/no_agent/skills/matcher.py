@@ -129,7 +129,11 @@ class SkillMatcher:
         q = vecs[0]
         return [(s, cosine(q, self._emb_cache[s.id][1])) for s in skills]
 
-    async def match(self, task: str, only: list[Skill] | None = None) -> MatchResult | None:
+    async def match(
+        self, task: str, only: list[Skill] | None = None, *, min_confidence: float | None = None
+    ) -> MatchResult | None:
+        """min_confidence：覆盖默认的置信度阈值（显式指定技能、只需要抽取参数时传 0）"""
+        threshold = self.min_confidence if min_confidence is None else min_confidence
         cands = [s for s, _ in await self.candidates(task, only)] if only is None else only
         if not cands:
             return None
@@ -152,7 +156,7 @@ class SkillMatcher:
         params = out.get("params") or {}
         if not isinstance(params, dict):
             return None
-        if confidence < self.min_confidence:
+        if confidence < threshold:
             logger.info("技能 %s 置信度 %.2f 过低，不使用", sid, confidence)
             return None
         if missing := skill.missing_params(params):

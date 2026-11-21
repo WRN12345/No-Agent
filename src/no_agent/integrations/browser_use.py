@@ -89,6 +89,7 @@ def make_browser_use_tool(session: BrowserSession, cfg: AgentConfig) -> Tool:
         },
         func=browser_agent,
         side_effect=True,
+        stateful=True,
         confirm=cfg.browser.browser_use_confirm,
         confirm_message=lambda a: f"即将让 browser-use 自主操作浏览器：\n  {a.get('task', '')}",
     )

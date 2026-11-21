@@ -9,6 +9,8 @@
 - side_effect：有副作用（写入、提交）。测试回放时不真正执行
 - confirm：执行前必须经用户确认。由框架在 Toolbox 中强制执行，不依赖脚本或模型自觉
 - interactive：需要等用户输入。不受超时限制，回放时使用录制的回答
+- stateful：结果依赖实时环境状态（如浏览器当前页面）。回放时只用录制结果，没有录制就报错，绝不真实执行——
+  否则后台的测试 / 影子运行会去操作用户正在使用的浏览器，结果也不可复现
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from typing import Any, Callable, Iterator
 
 TRACE_OUTPUT_LIMIT = 4_000  # 写入轨迹 / 喂给 LLM 的输出截断长度
 FIXTURE_OUTPUT_LIMIT = 50_000  # 测试回放 fixture 的最大输出长度
+STATEFUL_FIXTURE_LIMIT = 1_000_000  # stateful 工具回放时不能真实执行，录制上限放宽
 
 
 class ToolError(Exception):
@@ -54,6 +57,8 @@ class Tool:
     confirm_message: Callable[[dict[str, Any]], str] | None = None
     # 交互式工具（需要等用户输入）
     interactive: bool = False
+    # 结果依赖实时环境状态（浏览器页面等）：回放时只用录制结果，不真实执行
+    stateful: bool = False
     # 哪个参数是要访问的 URL（用于技能的域名权限检查）
     url_arg: str | None = None
 
@@ -91,6 +96,7 @@ def tool(
     confirm: bool | Callable[[dict[str, Any]], bool] = False,
     confirm_message: Callable[[dict[str, Any]], str] | None = None,
     interactive: bool = False,
+    stateful: bool = False,
     url_arg: str | None = None,
 ) -> Callable[[Callable[..., Any]], Tool]:
     """把函数声明为工具"""
@@ -105,6 +111,7 @@ def tool(
             confirm=confirm,
             confirm_message=confirm_message,
             interactive=interactive,
+            stateful=stateful,
             url_arg=url_arg,
         )
 
@@ -203,6 +210,7 @@ class ToolCallRecord:
     ms: int = 0
     step: str | None = None
     replayed: bool = False
+    stateful: bool = False
 
     def to_trace(self) -> dict[str, Any]:
         return {
@@ -219,7 +227,7 @@ class ToolCallRecord:
     def to_fixture(self) -> dict[str, Any] | None:
         """用于测试回放；输出太大则不录制（回放时走真实调用）"""
         size = len(json.dumps(self.output, ensure_ascii=False, default=str))
-        if size > FIXTURE_OUTPUT_LIMIT:
+        if size > (STATEFUL_FIXTURE_LIMIT if self.stateful else FIXTURE_OUTPUT_LIMIT):
             return None
         return {"tool": self.tool, "args": self.args, "ok": self.ok, "output": self.output, "error": self.error}
 
@@ -319,7 +327,9 @@ class Toolbox:
         return self.wait_seconds + ongoing
 
     async def _invoke(self, t: Tool, args: dict[str, Any], step: str | None) -> Any:
-        rec = ToolCallRecord(tool=t.name, args=to_jsonable(args), ok=True, side_effect=t.has_side_effect(args), step=step)
+        rec = ToolCallRecord(
+            tool=t.name, args=to_jsonable(args), ok=True, side_effect=t.has_side_effect(args), step=step, stateful=t.stateful
+        )
         t0 = time.perf_counter()
         try:
             if t.interactive:
@@ -358,7 +368,8 @@ class ReplayToolbox(Toolbox):
     1. 参数完全一致的调用 → 返回录制结果（确定、零成本）
     2. 交互式工具（问用户）→ 参数不一致时按顺序回放录制的回答，绝不真的去问
     3. 有副作用 / 需确认的调用 → 不真正执行，返回 dry_run 标记
-    4. 其他只读调用 → 真实执行
+    4. 依赖实时状态的调用（stateful）→ 没有录制就报错，不真实执行
+    5. 其他只读调用 → 真实执行
     """
 
     def __init__(self, registry: ToolRegistry, fixtures: list[dict[str, Any]], timeout: float = 60.0) -> None:
@@ -400,4 +411,6 @@ class ReplayToolbox(Toolbox):
                 ToolCallRecord(tool=name, args=args, ok=True, output={"dry_run": True}, side_effect=True, step=step, replayed=True)
             )
             return {"ok": True, "dry_run": True}
+        if t.stateful:
+            raise ToolError(f"回放中没有录制 {name} 的这次调用（{name} 依赖实时状态，回放时不真实执行）")
         return await self._invoke(t, args, step)

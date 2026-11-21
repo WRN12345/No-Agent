@@ -143,13 +143,32 @@ class Evolver:
         self.matcher = matcher
         self.s = settings
         self.queue: asyncio.Queue[Job] = asyncio.Queue()
+        self._queue_loop: asyncio.AbstractEventLoop | None = None  # 队列当前绑定的事件循环
         self.history: deque[dict[str, Any]] = deque(maxlen=100)
         self._task: asyncio.Task | None = None
 
     # ── 生命周期 ──
 
+    def _bind_queue(self) -> None:
+        """
+        asyncio.Queue 第一次等待时会绑定到当时的事件循环。run_sync 每次调用都是一个新的事件循环，
+        所以换了循环就换一个新队列，把还没处理的任务搬过去。
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return  # 不在事件循环里（例如同步代码中 submit）：先放进当前队列，start 时再搬
+        if self._queue_loop is loop:
+            return
+        if self._queue_loop is not None:
+            old, self.queue = self.queue, asyncio.Queue()
+            while not old.empty():
+                self.queue.put_nowait(old.get_nowait())
+        self._queue_loop = loop
+
     def start(self) -> None:
-        if self._task is None or self._task.done():
+        self._bind_queue()
+        if self._task is None or self._task.done() or self._task.get_loop() is not self._queue_loop:
             self._task = asyncio.create_task(self._loop(), name="evolver")
 
     async def stop(self) -> None:
@@ -162,32 +181,39 @@ class Evolver:
             self._task = None
 
     def submit(self, job: Job) -> None:
+        self._bind_queue()
         self.queue.put_nowait(job)
 
     async def drain(self) -> None:
         """等待队列处理完（测试 / 运维用）"""
+        self._bind_queue()
         await self.queue.join()
 
     async def _loop(self) -> None:
+        queue = self.queue
         while True:
-            job = await self.queue.get()
+            job = await queue.get()
             t0 = time.perf_counter()
-            with metered() as meter:
-                try:
-                    outcome = await self.handle(job)
-                except Exception as e:  # noqa: BLE001
-                    logger.exception("进化任务失败: %s", job)
-                    outcome = {"status": "error", "error": f"{type(e).__name__}: {e}"}
-            entry = {
-                **asdict(job),
-                **outcome,
-                "tokens": meter.total_tokens,
-                "ms": int((time.perf_counter() - t0) * 1000),
-                "at": datetime.now().isoformat(timespec="seconds"),
-            }
-            self.history.append(entry)
-            logger.info("进化任务完成: %s", entry)
-            self.queue.task_done()
+            outcome: dict[str, Any] = {"status": "cancelled"}
+            try:
+                with metered() as meter:
+                    try:
+                        outcome = await self.handle(job)
+                    except Exception as e:  # noqa: BLE001
+                        logger.exception("进化任务失败: %s", job)
+                        outcome = {"status": "error", "error": f"{type(e).__name__}: {e}"}
+            finally:
+                # 被 stop(wait=False) 取消时也要 task_done，否则之后的 drain() 会永远等下去
+                entry = {
+                    **asdict(job),
+                    **outcome,
+                    "tokens": meter.total_tokens,
+                    "ms": int((time.perf_counter() - t0) * 1000),
+                    "at": datetime.now().isoformat(timespec="seconds"),
+                }
+                self.history.append(entry)
+                logger.info("进化任务%s: %s", "被取消" if outcome["status"] == "cancelled" else "完成", entry)
+                queue.task_done()
 
     async def handle(self, job: Job) -> dict[str, Any]:
         run = self.runs.get(job.run_id)
