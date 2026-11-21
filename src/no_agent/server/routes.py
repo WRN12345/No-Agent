@@ -9,7 +9,6 @@ from typing import Any, Callable
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from no_agent.agent import Agent
-from no_agent.engine.evolver import Job
 from no_agent.server.schemas import (
     FeedbackRequest,
     RunDetail,
@@ -116,27 +115,13 @@ def create_router(agent: Agent | Callable[[], Agent], *, api_token: str | None =
 
     @router.post("/feedback", tags=["run"])
     async def feedback(req: FeedbackRequest, a: Agent = Depends(get_agent)) -> dict[str, Any]:
-        """
-        异步反馈（可选接入）：
-        - 记录到运行记录与技能统计
-        - 负反馈的自由执行轨迹不会被提炼
-        - 负反馈的脚本运行（脚本自认为成功）→ 触发修补并加强 verify
-        """
-        run = a.runs.get(req.run_id)
-        if run is None:
-            raise HTTPException(404, "运行记录不存在")
-        run.feedback_score, run.feedback_comment = req.score, req.comment
-        a.runs.save(run)
-
-        queued = False
-        if run.skill_id and (skill := a.store.get(run.skill_id)):
-            skill.stats.feedback_sum += req.score
-            skill.stats.feedback_count += 1
-            a.store.save_stats(skill)
-            if req.score < 0 and run.mode == "skill":
-                a.evolver.submit(Job("feedback", run.id))
-                queued = True
-        return {"ok": True, "patch_queued": queued}
+        """反馈运行结果（可选接入），见 Agent.feedback"""
+        try:
+            return a.feedback(req.run_id, req.score, req.comment)
+        except KeyError as e:
+            raise HTTPException(404, "运行记录不存在") from e
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
 
     # ── 技能 ──
 

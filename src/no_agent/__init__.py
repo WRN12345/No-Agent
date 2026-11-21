@@ -1,5 +1,5 @@
 """
-No-Agent：自进化 Agent 框架
+No-Agent：自进化 Agent 框架（包名 No-Agent，导入名 no_agent，环境变量前缀 NO_AGENT_）
 
 能用脚本就用脚本；脚本坏了 AI 接管并自动修补；没见过的任务 AI 自己做，做多了沉淀成技能。
 """

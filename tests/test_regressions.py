@@ -391,3 +391,97 @@ def test_record_shadow_uses_fresh_skill(tmp_path, fast, strong, web):
     out = agent.evolver._record_shadow(stale, run, True, "一致")  # stale 还指着旧候选 v2
     assert out["status"] == "skipped"
     assert agent.store.get("fetch-body").shadow.passes == 0
+
+
+# ── 变更审查：动态调用按内容比较 ──
+
+
+DYN_BASE = """
+@step
+async def a(ctx):
+    name = ctx.params["t"]
+    await ctx.tool(name, x=1)
+"""
+
+# 数量没变，但换成了另一个动态目标
+DYN_SWAPPED = """
+@step
+async def a(ctx):
+    other = ctx.state["t"]
+    await ctx.tool(other, x=1)
+"""
+
+# 只是挪了行号、改了其他参数
+DYN_MOVED = """
+@step
+async def a(ctx):
+    ctx.log("x")
+    name = ctx.params["t"]
+    await ctx.tool(name, x=2)
+"""
+
+# 同一个动态调用多写了一次
+DYN_TWICE = """
+@step
+async def a(ctx):
+    name = ctx.params["t"]
+    await ctx.tool(name, x=1)
+    await ctx.tool(name, x=1)
+"""
+
+
+def test_review_flags_replaced_dynamic_call():
+    from no_agent.skills.review import review_patch
+
+    skill = Skill(id="s", name="s", description="d")
+    r = review_patch(skill, 1, DYN_BASE, DYN_SWAPPED)  # 换了目标 → 需要审查
+    assert r is not None and any("ctx.tool" in x for x in r.dynamic_calls)
+
+    assert review_patch(skill, 1, DYN_BASE, DYN_MOVED) is None  # 不算新的动态调用
+
+    r = review_patch(skill, 1, DYN_BASE, DYN_TWICE)  # 按次数算 → 需要审查
+    assert r is not None and len(r.dynamic_calls) == 1
+
+
+# ── 回放：同样参数录制了多次 ──
+
+
+async def test_replay_repeated_calls_in_recorded_order():
+    @tool("poll")
+    def poll(job: str):
+        raise AssertionError("不应真实执行")
+
+    fixtures = [{"tool": "poll", "args": {"job": "j"}, "ok": True, "output": s} for s in ("running", "running", "done")]
+    box = ReplayToolbox(ToolRegistry([poll]), fixtures)
+    got = [await box.call("poll", {"job": "j"}) for _ in range(4)]
+    assert got == ["running", "running", "done", "done"]  # 按录制顺序，用完后一直返回最后一次
+
+
+# ── 反馈：库 / HTTP / MCP 共用 Agent.feedback ──
+
+
+async def test_agent_feedback_queues_patch(tmp_path, fast, strong, web):
+    web.pages["http://a.test/"] = "hello"
+    async with _make_agent(tmp_path, fast, strong, web) as agent:
+        _create_skill(agent)
+        run = await agent.skill("fetch-body").run({"url": "http://a.test/"})
+        assert run.mode == "skill"
+        agent.evolver.handle = _noop_handle  # type: ignore[method-assign]  # 只看是否投递了修补
+
+        out = agent.feedback(run.id, -1, "正文不对")
+        assert out == {"ok": True, "patch_queued": True}
+        saved = agent.runs.get(run.id)
+        assert saved.feedback_score == -1 and saved.feedback_comment == "正文不对"
+        assert agent.store.get("fetch-body").stats.feedback_count == 1
+
+        assert agent.feedback(run.id, 1)["patch_queued"] is False
+        with pytest.raises(KeyError):
+            agent.feedback("nope", 1)
+        with pytest.raises(ValueError):
+            agent.feedback(run.id, 5)
+        await agent.wait_idle()
+        assert [h["kind"] for h in agent.evolver.history] == ["feedback"]
+
+
+async def _noop_handle(job):
+    return {"status": "ok"}

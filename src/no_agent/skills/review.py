@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import ast
+from collections import Counter
 from dataclasses import dataclass, field
 
 from no_agent.skills.models import Review, Skill
@@ -31,6 +32,8 @@ class Capabilities:
     imports: set[str] = field(default_factory=set)
     llm_calls: int = 0
     dynamic: list[str] = field(default_factory=list)  # 无法静态确定目标的调用（行号 + 说明）
+    # 与 dynamic 一一对应的键：调用处的表达式（不含行号），用来比较两个版本"多了哪些"动态调用
+    dynamic_keys: list[str] = field(default_factory=list)
 
 
 def capabilities(source: str) -> Capabilities:
@@ -62,9 +65,27 @@ def capabilities(source: str) -> Capabilities:
             if literal:
                 (caps.tools if node.attr == "tool" else caps.skills).add(call.args[0].value)  # type: ignore[union-attr]
             else:
-                caps.dynamic.append((node.lineno, f"第 {node.lineno} 行: ctx.{node.attr} 的目标不是字面量，无法静态确定会调用什么"))  # type: ignore[arg-type]
-    caps.dynamic = [msg for _, msg in sorted(caps.dynamic)]  # type: ignore[misc]  # ast.walk 是广度优先，按行号排序
+                # 调用：以"调用目标"那个参数的表达式为键（改其他参数不算新的动态调用）；
+                # 非调用（把 ctx.tool 赋给变量 / 传出去）：以 ctx.tool 本身为键
+                key = ast.unparse(call.args[0]) if isinstance(call, ast.Call) and call.func is node and call.args else ast.unparse(node)
+                caps.dynamic.append(  # type: ignore[arg-type]
+                    (node.lineno, f"第 {node.lineno} 行: ctx.{node.attr} 的目标不是字面量，无法静态确定会调用什么", key)
+                )
+    items = sorted(caps.dynamic)  # type: ignore[arg-type]  # ast.walk 是广度优先，按行号排序
+    caps.dynamic = [msg for _, msg, _ in items]  # type: ignore[misc]
+    caps.dynamic_keys = [key for _, _, key in items]  # type: ignore[misc]
     return caps
+
+
+def _added_dynamic(base: Capabilities, new: Capabilities) -> list[str]:
+    """新版本比基准版本多出来的动态调用（按调用表达式比较，不看行号；同一个表达式出现多次按次数算）"""
+    extra = Counter(new.dynamic_keys) - Counter(base.dynamic_keys)
+    out = []
+    for key, msg in zip(new.dynamic_keys, new.dynamic):
+        if extra[key] > 0:
+            extra[key] -= 1
+            out.append(msg)
+    return out
 
 
 def _finish(review: Review) -> Review | None:
@@ -86,7 +107,7 @@ def review_patch(skill: Skill, base_version: int, base_source: str, new_source: 
         base_version=base_version,
         added_tools=sorted(new.tools - tool_base - ALWAYS_ALLOWED),
         added_skills=sorted(new.skills - skill_base),
-        dynamic_calls=new.dynamic if len(new.dynamic) > len(base.dynamic) else [],
+        dynamic_calls=_added_dynamic(base, new),
         added_imports=sorted(new.imports - base.imports),
         llm_calls_before=base.llm_calls,
         llm_calls_after=new.llm_calls,

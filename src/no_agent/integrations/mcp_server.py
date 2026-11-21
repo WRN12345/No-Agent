@@ -161,6 +161,20 @@ def create_mcp_server(agent: Agent, *, name: str = "no-agent", expose_skills: bo
                 inputSchema={"type": "object", "properties": {}},
                 annotations=types.ToolAnnotations(readOnlyHint=True),
             ),
+            types.Tool(
+                name="feedback",
+                description="对某次运行的结果打分（-1 差 ~ 1 好）。结果看似成功其实不对时给负分，会触发后台修补技能脚本。",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "run_id": {"type": "string", "description": "run_task / skill_* 返回的 run_id"},
+                        "score": {"type": "number", "minimum": -1, "maximum": 1},
+                        "comment": {"type": "string", "description": "哪里不对"},
+                    },
+                    "required": ["run_id", "score"],
+                },
+                annotations=types.ToolAnnotations(readOnlyHint=False, destructiveHint=False),
+            ),
         ]
         for tool_name, s in skill_tools().items():
             desc = s.description + (f"\n适用：{s.when_to_use}" if s.when_to_use else "")
@@ -188,6 +202,11 @@ def create_mcp_server(agent: Agent, *, name: str = "no-agent", expose_skills: bo
                 }
                 for s in agent.skills()
             ]
+        elif tool_name == "feedback":
+            try:
+                data = agent.feedback(str(arguments.get("run_id", "")), float(arguments.get("score", 0)), arguments.get("comment"))
+            except KeyError as e:
+                raise ValueError(str(e)) from e
         elif tool_name in (st := skill_tools()):
             try:
                 run = await agent.skill(st[tool_name].id).run(arguments)

@@ -22,6 +22,8 @@ pip install "No-Agent[mcp]"       # MCP 服务端 / 客户端
 pip install "No-Agent[browser-use]"  # browser-use 浏览器 Agent（开放式网页探索）
 ```
 
+> 命名约定：发行包和命令行叫 `No-Agent`；代码里 `import no_agent`；环境变量前缀 `NO_AGENT_`，数据目录 `.no-agent/`。
+
 发布到 PyPI 之前，直接从 GitHub 安装：
 
 ```bash
@@ -54,6 +56,8 @@ async with agent:                                  # 启动后台进化器；退
     print(run.mode, run.result)                    # mode: skill / skill_takeover / guide / freeform / aborted / error
 
 run = agent.run_sync("查一下所有待发货的订单")      # 同步代码中使用
+
+agent.feedback(run.id, -1, "漏了今天的订单")         # 可选：反馈结果；脚本"成功"但结果不对时触发修补
 ```
 
 也可以从环境变量读配置：`Agent(AgentConfig.from_env())`，变量见 [.env.example](.env.example)（前缀 `NO_AGENT_`）。环境变量只在 `from_env()` 里生效，CLI 和 HTTP 服务（包括 Docker 镜像）用的就是它；直接构造 `AgentConfig(...)` 时不读环境变量（`NO_AGENT_HOME` 除外，见下文“`.no-agent/` 的位置”）。
@@ -170,7 +174,7 @@ no-agent sign skills/fill-form --key team.key --signer team
 | `worker_cpu_seconds` | `300` | CPU 时间兜底上限，主进程崩溃时也能终止失控的脚本 |
 | `script_max_tool_calls` / `script_max_llm_calls` | `500` / `100` | 一次执行（含子技能）的调用次数上限 |
 
-这一档能保证：脚本即使逃逸了 Python 层的沙箱，也拿不到密钥、绕不过工具和域名权限；死循环会在步骤超时后被终止。它**不**阻止脚本读写当前用户能访问的文件，也不阻止直接联网。需要这一级隔离时，请在 Linux 上使用 `"sandbox"`。设计见 [docs/design/script-isolation.html](docs/design/script-isolation.html)。
+这一档能保证：脚本即使逃逸了 Python 层的沙箱，也拿不到密钥、绕不过工具和域名权限；死循环会在步骤超时后被终止。它**不**阻止脚本读写当前用户能访问的文件，也不阻止直接联网。需要这一级隔离时，请在 Linux 上使用 `"sandbox"`。实现见 [skills/process.py](src/no_agent/skills/process.py)（子进程与预热池）、[skills/_worker.py](src/no_agent/skills/_worker.py)（worker 协议）、[skills/_confine.py](src/no_agent/skills/_confine.py)（Linux 内核约束）。
 
 ## 自动上线前的变更审查
 
@@ -243,6 +247,7 @@ open_page → snapshot（一次读出全部字段：标签/类型/必填/选项/
 |---|---|
 | `run_task(task)` | 执行任意任务（自动选择 技能脚本 / AI 接管 / AI 自由执行） |
 | `list_skills()` | 列出技能 |
+| `feedback(run_id, score, comment)` | 反馈运行结果（-1 ~ 1）；脚本"成功"但结果不对时给负分，触发后台修补 |
 | `skill_<id>(...)` | 每个流程型技能一个工具，参数就是技能的 `params_schema`（显式调用，零匹配开销）；按技能权限标注 `readOnlyHint` / `destructiveHint` |
 | 资源 `skill://<id>/SKILL.md` | 每个技能的 SKILL.md，客户端可以直接读来当指南 |
 
@@ -383,7 +388,7 @@ docker compose up                  # 见 docker-compose.yml，数据在 /data �
 
 ## 已知限制 / 后续方向
 
-- **沙箱不是强隔离**：AST 白名单 + 受限 builtins 能挡住常见误用，但不是安全边界。工具能触及敏感系统时，应把脚本执行放到独立进程 / 容器。
+- **隔离档位**：默认的 `process` 档不阻止脚本（逃逸 Python 层沙箱后）读写本机文件或直接联网；强隔离的 `sandbox` 档目前只支持 Linux。Windows / macOS 上执行不可信脚本，请部署到 Linux 容器中。
 - **单进程**：进化器是进程内 asyncio 队列，文件技能库用进程内锁。多进程 / 多实例部署需要外部队列和带锁的存储（可通过自定义 `SkillStore` 实现）。
 - **命名空间（多租户）**：尚未支持，计划后续加入，届时通过 `schema_version` 迁移已有数据。
 - **共享技能的上游更新**：技能一旦复制到本地（被修补 / 转正），本地版本优先，不会自动合并上游更新。

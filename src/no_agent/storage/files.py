@@ -117,7 +117,7 @@ class FileSkillStore:
         verifier：只读层技能的信任检查（返回 (是否可信, 说明)）。不可信的技能一律不对外生效，
           也不能被其他技能 ctx.skill() 调用；需要签名或 install 显式信任。
         untrusted_mode：不可信流程型技能的处理
-          block  → 完全不执行（默认）。脚本在进程内执行，沙箱不是强安全边界，执行即等于信任
+          block  → 完全不执行（默认）。只有 sandbox 档有操作系统级约束，其他档位下执行即等于信任
           shadow → 在本地任务上影子运行、比对通过后转正（只在 script_isolation="sandbox" 下真正执行，其他档位跳过）
         verifier 为 None 时只读层全部视为可信
         """

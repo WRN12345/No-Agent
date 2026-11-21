@@ -365,7 +365,8 @@ class Toolbox:
 class ReplayToolbox(Toolbox):
     """
     测试回放用：
-    1. 参数完全一致的调用 → 返回录制结果（确定、零成本）
+    1. 参数完全一致的调用 → 返回录制结果（确定、零成本）。同样参数录制了多次（如轮询）时按录制顺序依次回放，
+       用完后一直返回最后一次的结果
     2. 交互式工具（问用户）→ 参数不一致时按顺序回放录制的回答，绝不真的去问
     3. 有副作用 / 需确认的调用 → 不真正执行，返回 dry_run 标记
     4. 依赖实时状态的调用（stateful）→ 没有录制就报错，不真实执行
@@ -374,12 +375,20 @@ class ReplayToolbox(Toolbox):
 
     def __init__(self, registry: ToolRegistry, fixtures: list[dict[str, Any]], timeout: float = 60.0) -> None:
         super().__init__(registry=registry, timeout=timeout)
-        self._fixtures = {args_key(f["tool"], f["args"]): f for f in fixtures}
+        self._fixtures: dict[str, list[dict[str, Any]]] = {}
+        for f in fixtures:
+            self._fixtures.setdefault(args_key(f["tool"], f["args"]), []).append(f)
         self._answers: dict[str, list[dict[str, Any]]] = {}
         for f in fixtures:
             t = registry.get(f["tool"])
             if t is not None and t.interactive:
                 self._answers.setdefault(f["tool"], []).append(f)
+
+    def _take(self, name: str, args: dict[str, Any]) -> dict[str, Any] | None:
+        seq = self._fixtures.get(args_key(name, to_jsonable(args)))
+        if not seq:
+            return None
+        return seq.pop(0) if len(seq) > 1 else seq[0]
 
     def _replay(self, name: str, args: dict[str, Any], fx: dict[str, Any], step: str | None) -> Any:
         self.calls.append(
@@ -394,15 +403,17 @@ class ReplayToolbox(Toolbox):
         if t is None:
             raise ToolError(f"未知工具: {name}")
         self.check_permission(t, args)
-        fx = self._fixtures.get(args_key(name, to_jsonable(args)))
+        fx = self._take(name, args)
         if t.interactive:
             queue = self._answers.get(name, [])
             if fx is None:
                 if not queue:
                     raise ToolError(f"测试回放中没有录制的 {name} 回答")
                 fx = queue[0]
-            if fx in queue:
-                queue.remove(fx)
+            for i, q in enumerate(queue):  # 按对象移除：录制了两次相同的回答时，只消耗一次
+                if q is fx:
+                    del queue[i]
+                    break
             return self._replay(name, args, fx, step)
         if fx is not None:
             return self._replay(name, args, fx, step)

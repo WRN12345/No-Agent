@@ -7,7 +7,8 @@ ProcessRunner：在一次性子进程（worker）中执行技能脚本
 - 只用 JSON 帧，绝不 pickle：反序列化 worker 发来的 pickle 等于让它在宿主执行代码
 - 超时 / 取消 → 直接终止进程；Windows 上用 Job Object 限制内存、禁止创建子进程，句柄关闭即终止
 
-它不阻止脚本（在逃逸 Python 层沙箱之后）读写当前用户能访问的文件或直接联网，见 docs/design/script-isolation.html。
+它不阻止脚本（在逃逸 Python 层沙箱之后）读写当前用户能访问的文件或直接联网；
+需要这一级隔离时用 sandbox 档（仅 Linux，见 skills/_confine.py）。
 """
 
 from __future__ import annotations

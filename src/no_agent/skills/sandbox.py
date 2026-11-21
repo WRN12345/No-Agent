@@ -2,13 +2,14 @@
 技能脚本沙箱：静态校验、受限加载、脚本侧的 ctx、单个阶段的执行与错误分类
 
 本模块只依赖标准库、不 import no_agent 的任何东西：
-进程内执行（InProcessRunner）和将来的子进程 worker 共用同一份代码。
+进程内执行（InProcessRunner）和子进程 worker（skills/_worker.py）共用同一份代码。
 脚本通过 ctx 对外部世界的一切请求都交给 Bridge（宿主侧实现权限检查、工具、LLM、子技能）。
 
 安全说明：这里的 AST 白名单 + 受限 builtins + 模块代理能挡住常见误用和已知的逃逸手法
 （import os、经白名单模块转手拿到 os/sys、帧对象回溯、match 类模式读私有属性、
 attrgetter / Formatter 等"字符串版 getattr"），但它仍然不是强安全边界：
-脚本与框架同进程运行时，死循环之类也无法被打断。不可信来源的脚本不应在进程内执行。
+脚本与框架同进程运行时，死循环之类也无法被打断。不可信来源的脚本不应在进程内执行
+（默认的 process 档在子进程中执行，sandbox 档再加内核约束）。
 """
 
 from __future__ import annotations

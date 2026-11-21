@@ -4,8 +4,8 @@
 宿主（execute_script）负责编排：阶段顺序、计时与超时、步骤记录、失败归因。
 Runner 只负责"在某处加载脚本、按指令执行单个阶段、交回快照"：
 
-    InProcessRunner   在宿主进程内执行（当前实现）
-    ProcessRunner     在一次性子进程中执行（计划中，见 docs/design/script-isolation.html）
+    InProcessRunner   在宿主进程内执行（script_isolation="inprocess"，仅用于测试或完全信任脚本的场景）
+    ProcessRunner     在一次性子进程中执行（默认 "process"；"sandbox" 再加 Linux 内核约束，见 skills/process.py）
 
 脚本对外部世界的一切请求都经由 CtxBridge，它始终运行在宿主：
 权限检查、确认、录制、LLM 调用、子技能调用都不会进入脚本所在的进程。

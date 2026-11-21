@@ -78,7 +78,7 @@ class McpServerConfig(BaseModel):
 
 
 class SkillRepoConfig(BaseModel):
-    """以只读方式使用的 git 技能仓库（no-agent sync 拉取 / 更新）"""
+    """以只读方式使用的 git 技能仓库（No-Agent sync 拉取 / 更新）"""
 
     url: str
     ref: str | None = None  # 分支 / 标签；None 用默认分支
@@ -116,7 +116,7 @@ class AgentConfig(BaseModel):
     tool_timeout: float = 60.0
     auto_confirm: bool = False  # 需确认的操作（提交等）是否跳过确认直接执行；默认每次都问
 
-    # ── 脚本隔离（见 docs/design/script-isolation.html）──
+    # ── 脚本隔离（实现见 skills/process.py、skills/_worker.py、skills/_confine.py）──
     # process：在一次性子进程中执行（默认）。逃逸后拿不到密钥和宿主对象、绕不过权限，死循环可被终止；
     #          但不阻止读写本机文件和直接联网
     # sandbox：process + 操作系统级约束（Linux：Landlock 只读文件系统 + seccomp 禁止联网 / 执行程序 / 创建进程）。

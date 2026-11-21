@@ -15,6 +15,7 @@ jobs:
         isolation: [process]
         # 整套测试在 sandbox 档下再跑一遍（只支持 Linux）
         include:
+          - { os: macos-latest, python: "3.12", isolation: process }
           - { os: ubuntu-24.04, python: "3.12", isolation: sandbox }
           - { os: ubuntu-24.04-arm, python: "3.12", isolation: sandbox }
     runs-on: ${{ matrix.os }}

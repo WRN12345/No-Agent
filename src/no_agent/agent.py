@@ -230,6 +230,34 @@ class Agent:
     def reject(self, skill_id: str, version: int, reason: str = "审查未通过") -> Skill:
         return self.store.reject_review(skill_id, version, reason)
 
+    def feedback(self, run_id: str, score: float, comment: str | None = None) -> dict[str, Any]:
+        """
+        对一次运行的结果给出反馈（score：-1 ~ 1）：
+        - 记录到运行记录与技能统计
+        - 负反馈的自由执行轨迹不会被提炼
+        - 负反馈的脚本运行（脚本自认为成功）→ 后台修补并加强 verify
+        返回 {"ok": True, "patch_queued": 是否触发了修补}；运行记录不存在时抛 KeyError
+        """
+        from no_agent.engine.evolver import Job
+
+        if not -1.0 <= score <= 1.0:
+            raise ValueError("score 应在 -1 到 1 之间")
+        run = self.runs.get(run_id)
+        if run is None:
+            raise KeyError(f"运行记录不存在: {run_id}")
+        run.feedback_score, run.feedback_comment = score, comment
+        self.runs.save(run)
+
+        queued = False
+        if run.skill_id and (skill := self.store.get(run.skill_id)):
+            skill.stats.feedback_sum += score
+            skill.stats.feedback_count += 1
+            self.store.save_stats(skill)
+            if score < 0 and run.mode == "skill":
+                self.evolver.submit(Job("feedback", run.id))
+                queued = True
+        return {"ok": True, "patch_queued": queued}
+
     def install_skill(self, path: str | Path, *, overwrite: bool = False) -> Skill:
         """
         从目录安装技能到本项目（复制）。可以是本框架产出的技能，也可以是普通的 Anthropic Skill（纯 SKILL.md）。
